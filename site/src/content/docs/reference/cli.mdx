@@ -1,0 +1,150 @@
+---
+title: CLI
+description: Subcommands and flags for the posthorn binary.
+---
+
+The `posthorn` binary exposes three subcommands.
+
+```bash
+posthorn <subcommand> [flags]
+```
+
+## `serve`
+
+Starts the listener(s) — HTTP always, plus the inbound SMTP listener if `[smtp_listener]` is configured.
+
+```bash
+posthorn serve --config /etc/posthorn/config.toml
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--config <path>` | `/etc/posthorn/config.toml` | Path to TOML config file |
+| `--listen <addr>` | `:8080` | HTTP bind address |
+
+The SMTP listener's bind address is configured in the TOML (`smtp_listener.listen`), not via a flag.
+
+### Behavior
+
+1. Load and validate the config (same checks `validate` runs).
+2. Construct handlers, transports, rate limiters, templates per endpoint.
+3. Bind the HTTP listener and (if configured) the SMTP listener — each in its own goroutine.
+4. Serve until SIGTERM/SIGINT.
+
+### Signal handling
+
+| Signal | Effect |
+|---|---|
+| `SIGTERM` | Graceful shutdown: stop accepting new connections, drain in-flight requests with a 15-second deadline, exit 0 |
+| `SIGINT` (Ctrl+C) | Same as SIGTERM |
+| Second `SIGTERM` / `SIGINT` | Force-exit immediately with code 1 |
+
+The 15-second drain deadline is intentionally longer than the per-request 10-second hard timeout, so any in-flight retry can complete gracefully. Press Ctrl+C twice in a terminal to force-exit a stuck process.
+
+### Logs
+
+`serve` writes structured JSON logs to stdout. With Docker, those are captured by the platform's logging driver. With systemd, they go to the journal. See [Log format](/reference/log-format/) for the full event catalog.
+
+A successful startup looks like:
+
+```json
+{"time":"2026-05-16T19:00:00Z","level":"INFO","msg":"posthorn starting","version":"v1.0.0","listen":":8080","config":"/etc/posthorn/config.toml","endpoints":2}
+{"time":"2026-05-16T19:00:00Z","level":"INFO","msg":"endpoint registered","path":"/api/contact","transport":"postmark","recipients":1}
+{"time":"2026-05-16T19:00:00Z","level":"INFO","msg":"http ingress listening","addr":":8080"}
+```
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Clean shutdown after SIGTERM/SIGINT |
+| `1` | Runtime error (config load failed, listener bind failed, transport build failed) |
+| `2` | Unknown subcommand or argument parsing failed |
+
+## `validate`
+
+Parses and validates the config without starting the listener.
+
+```bash
+posthorn validate --config /etc/posthorn/config.toml
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--config <path>` | `/etc/posthorn/config.toml` | Path to TOML config file |
+
+### What it checks
+
+1. TOML syntax — file parses cleanly.
+2. `${env.VAR}` placeholders — every referenced env var is set (all missing reported in one error).
+3. Schema — required fields present, types match, paths start with `/`.
+4. Templates — `subject` and `body` Go templates compile.
+5. Mode/defense mutex — api-mode endpoints don't carry form-mode-only fields (`honeypot`, `allowed_origins`, `redirect_*`, `csrf_secret`); form-mode endpoints don't carry api-mode-only fields (`api_keys`, `idempotency_cache_size`).
+6. Allowed-origin sanity — `allowed_origins = []` is rejected.
+7. Path uniqueness — no two HTTP endpoints share a path.
+8. SMTP listener structural checks (when `[smtp_listener]` is present) — `listen` present, `allowed_senders` non-empty, auth shape valid, TLS material consistent with mode.
+
+### Output
+
+On success:
+
+```text
+$ posthorn validate --config posthorn.toml
+config OK: 2 endpoint(s)
+```
+
+Exit 0.
+
+On failure, the first error is printed to stderr and exit is non-zero. Errors are surfaced one at a time — fix the reported error and re-run to see the next, if any:
+
+```text
+$ posthorn validate --config posthorn.toml
+posthorn: config: endpoints[0] (/api/contact): transport: postmark transport requires settings.api_key
+exit status 1
+```
+
+### Use cases
+
+- **Pre-deploy check.** Run `validate` in CI before deploying a new config. Catch typos before they take down the listener.
+- **Health check substitute.** In platforms without a `/healthz` endpoint, run `validate` as a startup probe to fail fast on config issues.
+- **Pre-commit hook.** Run `validate` from `.git/hooks/pre-commit` to prevent committing a broken config.
+
+## `version`
+
+```bash
+$ posthorn version
+posthorn v1.0.0
+```
+
+Aliased to `--version` and `-v`. The output is `posthorn <version>` on a single line — the version string is injected at build time via `-ldflags "-X main.version=v1.0.0"`. Local development builds print `posthorn v0.0.1-dev`.
+
+## `help`
+
+```bash
+$ posthorn help
+posthorn — outbound mail gateway
+
+Usage:
+  posthorn serve     [--config <path>] [--listen <addr>]
+  posthorn validate  [--config <path>]
+  posthorn version
+  posthorn help
+
+Examples:
+  posthorn serve --config /etc/posthorn/config.toml
+  posthorn validate --config ./posthorn.toml
+```
+
+Aliased to `--help` and `-h`. Subcommand-specific help is not separately wired — the top-level `help` lists the flag set for each subcommand.
+
+## Environment variables
+
+`posthorn` reads no env vars of its own. The only env vars it uses are the ones referenced from the TOML config via `${env.VAR}` placeholders.
+
+Notably:
+
+- There's no `POSTHORN_CONFIG` to override `--config`. Use the flag.
+- There's no `POSTHORN_LISTEN` to override `--listen`. Use the flag.
+- There's no `POSTHORN_LOG_LEVEL`. Use the `[logging]` section in the TOML.
+
+This is intentional — there's one source of truth for config (the TOML), and one mechanism for secrets (`${env.VAR}` substitution).

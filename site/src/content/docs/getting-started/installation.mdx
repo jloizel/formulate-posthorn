@@ -1,0 +1,85 @@
+---
+title: Installation
+description: Install Posthorn as a Docker container or a Go binary.
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+Posthorn ships in two forms. **Docker is the recommended path** for most operators — it's a single container running next to your apps, and it's the deployment shape exercised most heavily in tests and documentation.
+
+<Tabs syncKey="install">
+  <TabItem label="Docker (recommended)">
+
+```bash
+docker pull ghcr.io/craigmccaskill/posthorn:latest
+```
+
+Multi-arch images are published for `linux/amd64` and `linux/arm64`. The container expects a TOML config mounted at `/etc/posthorn/config.toml` and listens on `8080` by default.
+
+A minimal `docker-compose.yml`:
+
+```yaml
+services:
+  posthorn:
+    image: ghcr.io/craigmccaskill/posthorn:latest
+    restart: unless-stopped
+    volumes:
+      - ./posthorn.toml:/etc/posthorn/config.toml:ro
+    environment:
+      POSTMARK_API_KEY: ${POSTMARK_API_KEY}
+    ports:
+      - "8080:8080"
+```
+
+Continue to the [Quick start](/getting-started/quick-start/) for a working contact form.
+
+  </TabItem>
+  <TabItem label="Standalone binary">
+
+```bash
+go install github.com/craigmccaskill/posthorn/cmd/posthorn@latest
+```
+
+Requires Go 1.25+. The binary is fully self-contained and runs anywhere.
+
+```bash
+posthorn validate --config posthorn.toml   # check the config without serving
+posthorn serve --config posthorn.toml      # start the HTTP listener
+```
+
+Pre-built binaries for common platforms are attached to each [GitHub release](https://github.com/craigmccaskill/posthorn/releases).
+
+  </TabItem>
+</Tabs>
+
+<Aside type="note">
+Posthorn does not terminate TLS. Run it behind a reverse proxy — Caddy, nginx, Traefik, Cloudflare, or whatever your front door already is. The [reverse proxy](/deployment/reverse-proxy/) page has worked examples for the common ones.
+</Aside>
+
+## Prerequisites
+
+Regardless of how you install Posthorn, you need:
+
+| Prerequisite | Why |
+|---|---|
+| A transactional mail provider account with a verified sender domain | Posthorn relays through your chosen provider. Five transports ship: [Postmark](https://postmarkapp.com), [Resend](https://resend.com), [Mailgun](https://mailgun.com), AWS SES, and a generic outbound-SMTP relay — see [Transports](/configuration/transports/). |
+| The provider's API key (or SMTP credentials for the outbound-SMTP transport) | Used in `[endpoints.transport.settings]`. For Postmark: the **server token**, not the account token. |
+| Sender Policy Framework (SPF), DomainKeys Identified Mail (DKIM), and Domain-based Message Authentication, Reporting & Conformance (DMARC) records on your sending domain | Required for deliverability regardless of transport — see [DNS](/security/dns/) |
+| A reverse proxy in front of Posthorn (Caddy, nginx, Traefik, Cloudflare) | TLS termination, HTTP/2, request logging |
+
+## Verifying the install
+
+```bash
+docker run --rm ghcr.io/craigmccaskill/posthorn:latest version
+# posthorn v1.0.0
+```
+
+If you're running the standalone binary:
+
+```bash
+posthorn version
+```
+
+(`--version` and `-v` work too; `version` is the canonical subcommand. Local development builds print `posthorn v0.0.1-dev` — the released tag is injected at build time.)
+
+For a deeper sanity check, run `posthorn validate --config <your-config>` — it parses the TOML, resolves `${env.VAR}` placeholders, and reports schema errors without starting the listener.

@@ -1,0 +1,1591 @@
+// Package gateway holds the HTTP form-ingress handler for Posthorn.
+//
+// One Handler instance is constructed per configured endpoint. Multiple
+// endpoints get multiple Handlers, each independent (FR2). The Handler
+// implements [net/http.Handler] and is path-unaware: it assumes the caller
+// has already routed the request to the right endpoint. The cmd/posthorn
+// binary uses [net/http.ServeMux] for routing.
+package gateway
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"mime"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/craigmccaskill/posthorn/captcha"
+	"github.com/craigmccaskill/posthorn/config"
+	"github.com/craigmccaskill/posthorn/csrf"
+	"github.com/craigmccaskill/posthorn/idempotency"
+	"github.com/craigmccaskill/posthorn/log"
+	"github.com/craigmccaskill/posthorn/metrics"
+	"github.com/craigmccaskill/posthorn/ratelimit"
+	"github.com/craigmccaskill/posthorn/reputation"
+	"github.com/craigmccaskill/posthorn/response"
+	"github.com/craigmccaskill/posthorn/spam"
+	"github.com/craigmccaskill/posthorn/storage"
+	"github.com/craigmccaskill/posthorn/template"
+	"github.com/craigmccaskill/posthorn/transport"
+	"github.com/craigmccaskill/posthorn/validate"
+)
+
+// defaultEmailField is the form field name searched for the submitter's
+// email when EndpointConfig.EmailField is unset.
+const defaultEmailField = "email"
+
+// toOverrideField is the api-mode JSON body field whose value (a string or
+// array of strings) replaces the endpoint's configured recipients for the
+// request (FR46, ADR-11). Sender identity (from) is intentionally not
+// overridable — see ADR-11 for the safety reasoning.
+const toOverrideField = "to_override"
+
+// attachmentsField is the structural api-mode JSON key for file
+// attachments (FR90) — never a template field.
+const attachmentsField = "attachments"
+
+// requestTimeout is the hard upper bound on a single submission's
+// processing time, including any retries (FR22). Declared as a var so
+// tests can override; production never mutates it. The retry delays
+// themselves live in the transport package (transport.SendWithRetry),
+// shared with the SMTP ingress per issue #59.
+var requestTimeout = 10 * time.Second
+
+// Handler accepts form submissions and forwards them via a Transport.
+//
+// Construct via [New]. The struct's fields are unexported because
+// post-construction mutation is not supported; tests use the constructor
+// and the Option pattern.
+type Handler struct {
+	cfg                  config.EndpointConfig
+	transport            transport.Transport
+	renderer             *template.Renderer
+	storageGate          *storage.Gate      // nil = no [storage]; v1.x behavior
+	limiter              *ratelimit.Limiter // nil if rate_limit not configured
+	authFailLimiter      *ratelimit.Limiter // nil on form-mode endpoints; per-IP brute-force defense for api-mode 401s
+	idemCache            idempotency.Cacher // nil on form-mode endpoints; Durable when storage attached (FR81)
+	trustedProxies       []netip.Prefix
+	emailField           string            // resolved at construction (cfg.EmailField or default)
+	maxBodySize          int64             // 0 = no cap
+	logFailedSubmissions bool              // resolved at construction (default true)
+	csrfTokenTTL         time.Duration     // resolved at construction (cfg.CSRFTokenTTL or default)
+	attachPolicy         *attachmentPolicy // nil = attachments not opted in (FR90)
+	logger               *slog.Logger
+	recorder             *metrics.Recorder // nil = no-op (default)
+
+	// Spam-check pipeline, built once from config (form mode only). Header
+	// checks run pre-parse/pre-rate-limit (origin, ...); form checks run
+	// post-parse (honeypot, csrf, ...). Each returns a spam.Verdict the
+	// handler renders through one mapping (applySpamVerdict), so adding a
+	// check is a new builder entry, not another inline block in ServeHTTP.
+	headerChecks []headerCheck
+	formChecks   []formCheck
+
+	// pob serves the proof-of-browser challenge (a GET on the endpoint);
+	// nil unless [endpoints.proof_of_browser] is configured. The matching
+	// verify check lives in formChecks.
+	pob *pobGate
+}
+
+// headerCheck inspects the request before the body is parsed (headers, IP).
+type headerCheck func(*http.Request) spam.Verdict
+
+// formCheck inspects the parsed form after the body is read. It receives
+// the client IP and a context so checks that make a network call
+// (reputation, captcha) can look up the submitter and honor cancellation.
+type formCheck func(ctx context.Context, form url.Values, clientIP string) spam.Verdict
+
+// defaultAuthFailureBudget caps brute-force attempts against api-mode
+// endpoints. Token bucket per client IP: defaultAuthFailureBudget tokens
+// total, refilling over defaultAuthFailureInterval. Each failed auth
+// consumes one token; successful auth consumes none. When the bucket is
+// empty, subsequent failed-auth attempts return 429 instead of 401.
+const (
+	defaultAuthFailureBudget   = 10
+	defaultAuthFailureInterval = time.Minute
+)
+
+// defaultCSRFTokenTTL is the resolved value when cfg.CSRFTokenTTL is
+// zero (operator didn't set it). One hour matches FR57's stated default.
+const defaultCSRFTokenTTL = time.Hour
+
+// Proof-of-browser (#45, ADR-18): a JS-gated submit token. pobTokenField
+// is the hidden form field the operator's inline script populates from
+// the challenge endpoint. defaultPOBTokenTTL matches the issue's default.
+const (
+	pobTokenField      = "_pob_token"
+	defaultPOBTokenTTL = 30 * time.Minute
+)
+
+// errPOBTooNew is the min-age (time-trap) rejection.
+var errPOBTooNew = errors.New("proof-of-browser token submitted too soon after issuance")
+
+// pobGate issues and verifies proof-of-browser tokens. It reuses the
+// CSRF HMAC-timestamp machinery (ADR-18: same token format, different
+// issuer — Posthorn issues via the challenge endpoint rather than the
+// operator at render time) and adds an optional minimum-age floor.
+type pobGate struct {
+	secret []byte
+	ttl    time.Duration
+	minAge time.Duration
+}
+
+func (p *pobGate) issue(now time.Time) string { return csrf.Issue(p.secret, now) }
+
+func (p *pobGate) verify(token string, now time.Time) error {
+	if err := csrf.Verify(token, p.secret, p.ttl, now); err != nil {
+		return err
+	}
+	if p.minAge > 0 {
+		// Verify passed, so the token is "<unix>.<hmac>" with a valid
+		// timestamp; re-parse it for the age check.
+		tsStr := token[:strings.IndexByte(token, '.')]
+		unix, err := strconv.ParseInt(tsStr, 10, 64)
+		if err != nil {
+			return err
+		}
+		if now.Sub(time.Unix(unix, 0)) < p.minAge {
+			return errPOBTooNew
+		}
+	}
+	return nil
+}
+
+// turnstileField is the form field Cloudflare Turnstile's widget writes
+// its response token into (#33).
+const turnstileField = "cf-turnstile-response"
+
+// buildCaptchaCheck builds the Turnstile form check, or returns nil when
+// unconfigured. On a provider/transport error it fails closed by default
+// (silent reject) or open (allow, metered) per on_provider_error.
+func buildCaptchaCheck(cfg *config.CaptchaConfig) (formCheck, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	v, err := captcha.New(captcha.Config{
+		BaseURL: cfg.BaseURL,
+		Secret:  cfg.SecretKey,
+		Timeout: cfg.Timeout.Std(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	failClosed := cfg.OnProviderError != "open" // default closed
+	return func(ctx context.Context, form url.Values, clientIP string) spam.Verdict {
+		err := v.Verify(ctx, form.Get(turnstileField), clientIP)
+		switch {
+		case err == nil:
+			return spam.Verdict{}
+		case errors.Is(err, captcha.ErrFailed):
+			// Silent 200 (NFR5 parity) so a bot can't tell it was caught.
+			return spam.Verdict{Blocked: true, Silent: true, Kind: "captcha"}
+		case failClosed:
+			return spam.Verdict{Blocked: true, Silent: true, Kind: "captcha", Reason: "provider error (fail-closed)"}
+		default:
+			// Fail open: allow, but meter the bypass.
+			return spam.Verdict{Kind: "captcha", Reason: err.Error(), FailedOpen: true}
+		}
+	}, nil
+}
+
+// buildPOBGate constructs the proof-of-browser gate, generating a random
+// secret when the operator didn't set one (single-replica zero-config).
+func buildPOBGate(cfg *config.ProofOfBrowserConfig) (*pobGate, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	secret := []byte(cfg.Secret)
+	if len(secret) == 0 {
+		secret = make([]byte, 32)
+		if _, err := rand.Read(secret); err != nil {
+			return nil, fmt.Errorf("generate secret: %w", err)
+		}
+	}
+	ttl := cfg.TTL.Std()
+	if ttl == 0 {
+		ttl = defaultPOBTokenTTL
+	}
+	return &pobGate{secret: secret, ttl: ttl, minAge: cfg.MinAge.Std()}, nil
+}
+
+// Option configures a Handler at construction time.
+type Option func(*Handler)
+
+// WithLogger overrides the default (discard) logger. The cmd/posthorn
+// binary passes the logger built from the [logging] config block.
+func WithLogger(l *slog.Logger) Option {
+	return func(h *Handler) {
+		if l != nil {
+			h.logger = l
+		}
+	}
+}
+
+// WithRecorder configures a metrics.Recorder for observability. Default
+// is nil, in which case all Recorder method calls are no-ops (the
+// methods are nil-safe). The cmd/posthorn binary constructs the
+// Recorder once and shares it across all handlers.
+func WithRecorder(r *metrics.Recorder) Option {
+	return func(h *Handler) {
+		h.recorder = r
+	}
+}
+
+// New constructs a Handler from a parsed endpoint config and a transport.
+//
+// Returns an error if the transport is nil, if the template parser fails,
+// if the body template references a missing file, or if rate-limit /
+// trusted-proxies / max-body-size config values are malformed.
+func New(cfg config.EndpointConfig, t transport.Transport, opts ...Option) (*Handler, error) {
+	if t == nil {
+		return nil, errors.New("gateway: transport is nil")
+	}
+	emailField := cfg.EmailField
+	if emailField == "" {
+		emailField = defaultEmailField
+	}
+
+	// Build the reserved-names set for the template renderer. These fields
+	// are intentionally excluded from the custom-fields passthrough block
+	// in the rendered body — operators have already accounted for them in
+	// their config (FR13).
+	reserved := make([]string, 0, len(cfg.Required)+3)
+	reserved = append(reserved, cfg.Required...)
+	reserved = append(reserved, emailField)
+	if cfg.Honeypot != "" {
+		reserved = append(reserved, cfg.Honeypot)
+	}
+	if cfg.Auth == config.AuthAPIKey {
+		// FR46: to_override is a structural api-mode field, not template
+		// content. Keep it out of the custom-fields passthrough block.
+		reserved = append(reserved, toOverrideField)
+	}
+	if cfg.CSRFSecret != "" {
+		// FR57: the CSRF token field is structural, not template content.
+		reserved = append(reserved, csrf.TokenField)
+	}
+	if cfg.ProofOfBrowser != nil {
+		// The proof-of-browser token field is structural (#45).
+		reserved = append(reserved, pobTokenField)
+	}
+	if cfg.Captcha != nil {
+		// The Turnstile response field is structural (#33).
+		reserved = append(reserved, turnstileField)
+	}
+
+	// FR71: body_format selects the render mode. HTML endpoints get the
+	// auto-escaping html/template path plus a text fallback (ADR-19).
+	var renderer *template.Renderer
+	var err error
+	if cfg.BodyFormat == config.BodyFormatHTML {
+		renderer, err = template.NewHTMLRenderer(cfg.Subject, cfg.Body, cfg.TextBody, reserved)
+	} else {
+		renderer, err = template.NewRenderer(cfg.Subject, cfg.Body, reserved)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("gateway: %w", err)
+	}
+
+	// max_body_size defaults to 1 MB when unset — safe-by-default so a
+	// stray unconfigured endpoint can't be DoS'd by streaming an unbounded
+	// body. Operators bump it up for large form uploads.
+	// FR90/FR91: attachment policy, parsed once.
+	attachPolicy, err := newAttachmentPolicy(cfg.Attachments)
+	if err != nil {
+		return nil, fmt.Errorf("gateway: %w", err)
+	}
+
+	rawMaxBodySize := cfg.MaxBodySize
+	if rawMaxBodySize == "" {
+		rawMaxBodySize = "1MB"
+	}
+	maxBody, err := spam.ParseSize(rawMaxBodySize)
+	if err != nil {
+		return nil, fmt.Errorf("gateway: max_body_size: %w", err)
+	}
+	if attachPolicy != nil {
+		if cfg.MaxBodySize == "" {
+			// Unset max_body_size on an attachment endpoint defaults to
+			// the attachment budget plus 1MB of form headroom — the 1MB
+			// default would reject every payload the operator just
+			// opted into (FR91).
+			maxBody = attachPolicy.maxTotal + 1<<20
+		} else if maxBody < attachPolicy.maxTotal {
+			return nil, fmt.Errorf("gateway: max_body_size (%d bytes) is smaller than attachments.max_total_size (%d bytes) — every allowed attachment set would be rejected at the body cap", maxBody, attachPolicy.maxTotal)
+		}
+	}
+
+	prefixes, err := ratelimit.ParsePrefixes(cfg.TrustedProxies)
+	if err != nil {
+		return nil, fmt.Errorf("gateway: trusted_proxies: %w", err)
+	}
+
+	var limiter *ratelimit.Limiter
+	if cfg.RateLimit != nil {
+		limiter, err = ratelimit.New(cfg.RateLimit.Count, cfg.RateLimit.Interval.Std(), 0)
+		if err != nil {
+			return nil, fmt.Errorf("gateway: rate_limit: %w", err)
+		}
+	}
+
+	// Idempotency cache: one per api-mode endpoint (FR41, ADR-8). Capacity
+	// defaults to DefaultCapacity when the operator hasn't set
+	// idempotency_cache_size (FR42).
+	var idemCache *idempotency.Cache
+	var authFailLimiter *ratelimit.Limiter
+	if cfg.Auth == config.AuthAPIKey {
+		capacity := cfg.IdempotencyCacheSize
+		if capacity <= 0 {
+			capacity = idempotency.DefaultCapacity
+		}
+		idemCache, err = idempotency.New(capacity, idempotency.DefaultTTL)
+		if err != nil {
+			return nil, fmt.Errorf("gateway: idempotency: %w", err)
+		}
+		// Per-IP brute-force defense: limits how many 401s a single
+		// client IP can rack up before getting 429'd. Successful auth
+		// never consumes from this budget, so legitimate callers are
+		// unaffected; brute-force scanners hit it almost immediately.
+		authFailLimiter, err = ratelimit.New(defaultAuthFailureBudget, defaultAuthFailureInterval, 0)
+		if err != nil {
+			return nil, fmt.Errorf("gateway: auth-failure limiter: %w", err)
+		}
+	}
+
+	// log_failed_submissions defaults to true per FR16 (operator can recover
+	// the data from logs on terminal failure). *bool distinguishes "operator
+	// omitted" from "operator explicitly set false" (ADR-4).
+	logFailed := true
+	if cfg.LogFailedSubmissions != nil {
+		logFailed = *cfg.LogFailedSubmissions
+	}
+
+	csrfTTL := cfg.CSRFTokenTTL.Std()
+	if csrfTTL == 0 {
+		csrfTTL = defaultCSRFTokenTTL
+	}
+
+	repChecker, err := buildReputationChecker(cfg.Reputation)
+	if err != nil {
+		return nil, fmt.Errorf("gateway: reputation: %w", err)
+	}
+
+	pob, err := buildPOBGate(cfg.ProofOfBrowser)
+	if err != nil {
+		return nil, fmt.Errorf("gateway: proof_of_browser: %w", err)
+	}
+
+	captchaCheck, err := buildCaptchaCheck(cfg.Captcha)
+	if err != nil {
+		return nil, fmt.Errorf("gateway: captcha: %w", err)
+	}
+
+	h := &Handler{
+		cfg:                  cfg,
+		transport:            t,
+		renderer:             renderer,
+		limiter:              limiter,
+		authFailLimiter:      authFailLimiter,
+		idemCache:            idemCache,
+		trustedProxies:       prefixes,
+		emailField:           emailField,
+		maxBodySize:          maxBody,
+		logFailedSubmissions: logFailed,
+		csrfTokenTTL:         csrfTTL,
+		attachPolicy:         attachPolicy,
+		logger:               log.Discard(), // overridable via WithLogger
+		headerChecks:         buildHeaderChecks(cfg),
+		pob:                  pob,
+		formChecks:           buildFormChecks(cfg, csrfTTL, emailField, repChecker, pob, captchaCheck),
+	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h, nil
+}
+
+// buildHeaderChecks assembles the pre-parse spam checks from config. Each
+// entry closes over its config so ServeHTTP just iterates. Form-mode
+// fields (allowed_origins) are empty on api-mode endpoints (rejected at
+// parse per ADR-10), so this returns nil there.
+func buildHeaderChecks(cfg config.EndpointConfig) []headerCheck {
+	var checks []headerCheck
+	if len(cfg.AllowedOrigins) > 0 {
+		allowed := cfg.AllowedOrigins
+		checks = append(checks, func(r *http.Request) spam.Verdict {
+			origin, referer := spam.ExtractOriginAndReferer(r)
+			if result, reason := spam.CheckOrigin(origin, referer, allowed); result == spam.HardReject {
+				v := spam.Blocks("origin")
+				v.Reason = reason
+				return v
+			}
+			return spam.Verdict{}
+		})
+	}
+	return checks
+}
+
+// buildReputationChecker constructs the StopForumSpam checker from the
+// endpoint's reputation config, or returns nil when unconfigured.
+func buildReputationChecker(cfg *config.ReputationConfig) (*reputation.Checker, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	failOpen := true // default; keeps a provider outage from blocking real mail
+	if cfg.FailOpen != nil {
+		failOpen = *cfg.FailOpen
+	}
+	confidence := cfg.Confidence
+	if confidence == 0 {
+		confidence = 90
+	}
+	return reputation.New(reputation.Config{
+		BaseURL:    cfg.BaseURL,
+		CheckEmail: slices.Contains(cfg.Check, "email"),
+		CheckIP:    slices.Contains(cfg.Check, "ip"),
+		Threshold:  confidence,
+		FailOpen:   failOpen,
+		Timeout:    cfg.Timeout.Std(),
+		CacheSize:  cfg.CacheSize,
+		CacheTTL:   cfg.CacheTTL.Std(),
+	})
+}
+
+// buildFormChecks assembles the post-parse spam checks from config.
+func buildFormChecks(cfg config.EndpointConfig, csrfTTL time.Duration, emailField string, rep *reputation.Checker, pob *pobGate, captchaCheck formCheck) []formCheck {
+	var checks []formCheck
+	if cfg.Honeypot != "" {
+		field := cfg.Honeypot
+		checks = append(checks, func(_ context.Context, form url.Values, _ string) spam.Verdict {
+			if spam.CheckHoneypot(form, field) == spam.SilentReject {
+				// Silent 200 so a bot can't tell rejection from success.
+				return spam.Verdict{Blocked: true, Silent: true, Kind: "honeypot"}
+			}
+			return spam.Verdict{}
+		})
+	}
+	if cfg.CSRFSecret != "" {
+		secret := []byte(cfg.CSRFSecret)
+		checks = append(checks, func(_ context.Context, form url.Values, _ string) spam.Verdict {
+			token := form.Get(csrf.TokenField)
+			if err := csrf.Verify(token, secret, csrfTTL, time.Now()); err != nil {
+				return spam.Verdict{Blocked: true, Kind: "csrf", Event: "csrf_rejected", Reason: err.Error()}
+			}
+			return spam.Verdict{}
+		})
+	}
+	if pob != nil {
+		// Proof-of-browser (#45): the submission must carry a valid
+		// challenge token, which only the page JavaScript can fetch.
+		// Cheap local HMAC check — runs before the network reputation call.
+		checks = append(checks, func(_ context.Context, form url.Values, _ string) spam.Verdict {
+			if err := pob.verify(form.Get(pobTokenField), time.Now()); err != nil {
+				return spam.Verdict{Blocked: true, Kind: "proof_of_browser", Event: "pob_rejected", Reason: err.Error()}
+			}
+			return spam.Verdict{}
+		})
+	}
+	if captchaCheck != nil {
+		// Turnstile verification (#33): the escalation tier for JS-capable
+		// bots. Network call; runs after the cheap local checks.
+		checks = append(checks, captchaCheck)
+	}
+	if rep != nil {
+		// Reputation lookup on the submitter email + client IP (#44).
+		// Content-agnostic — targets repeat form-spam identities. Runs
+		// last among form checks: it's the only one that makes a network
+		// call, so the free local checks short-circuit before it.
+		checks = append(checks, func(ctx context.Context, form url.Values, clientIP string) spam.Verdict {
+			res := rep.Check(ctx, form.Get(emailField), clientIP)
+			if res.Blocked {
+				return spam.Verdict{Blocked: true, Kind: "reputation", Reason: res.Reason}
+			}
+			if res.FailedOpen {
+				// Not blocked, but record the outage bypass.
+				return spam.Verdict{Kind: "reputation", Reason: res.Reason, FailedOpen: true}
+			}
+			return spam.Verdict{}
+		})
+	}
+	return checks
+}
+
+// serveChallenge answers a GET on a proof-of-browser endpoint with a
+// fresh token as JSON. When allowed_origins is configured, it enforces
+// the same origin allow-list so tokens can't be farmed from other sites;
+// it echoes an allowed Origin for CORS so a cross-origin form fetch can
+// read the token.
+func (h *Handler) serveChallenge(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	if origin != "" && len(h.cfg.AllowedOrigins) > 0 {
+		if res, _ := spam.CheckOrigin(origin, "", h.cfg.AllowedOrigins); res == spam.HardReject {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	}
+	if origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Vary", "Origin")
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(map[string]string{"token": h.pob.issue(time.Now())})
+}
+
+// applySpamVerdict renders a blocking Verdict as the log line, metric, and
+// HTTP response, and reports whether it handled the request. A passing
+// verdict returns false so ServeHTTP continues. This is the single mapping
+// every spam check flows through.
+func (h *Handler) applySpamVerdict(w http.ResponseWriter, r *http.Request, logger *slog.Logger, v spam.Verdict, clientIP, submissionID string, start time.Time) bool {
+	if !v.Blocked {
+		if v.FailedOpen {
+			// A reputation lookup errored and we fail-open. Not blocked,
+			// but meter the bypass so a sustained outage is visible.
+			logger.Info(v.Kind+"_failed_open",
+				slog.String("kind", v.Kind),
+				slog.String("reason", v.Reason),
+			)
+			h.recorder.CheckFailedOpen(h.cfg.Path, v.Kind)
+		}
+		return false
+	}
+	event := v.Event
+	if event == "" {
+		event = "spam_blocked"
+	}
+	attrs := []any{slog.String("kind", v.Kind)}
+	if v.Reason != "" {
+		attrs = append(attrs, slog.String("reason", v.Reason))
+	}
+	attrs = append(attrs, slog.Int64("latency_ms", time.Since(start).Milliseconds()))
+	if !h.cfg.StripClientIP && clientIP != "" {
+		// Operator forensics parity with rate_limited (FR59 opt-out).
+		attrs = append(attrs, slog.String("client_ip", clientIP))
+	}
+	logger.Info(event, attrs...)
+	h.recorder.SpamBlocked(h.cfg.Path, v.Kind)
+
+	if v.Silent {
+		h.writeSuccessResponse(w, r, response.Success{Status: "ok", SubmissionID: submissionID})
+	} else {
+		status := v.Status
+		if status == 0 {
+			status = http.StatusForbidden
+		}
+		h.writeErrorResponse(w, r, status, "forbidden")
+	}
+	return true
+}
+
+// ServeHTTP implements [net/http.Handler].
+//
+// Pipeline order (per architecture doc §"Request flow"):
+//
+//  1. Body size cap    → http.MaxBytesReader (if configured)
+//  2. Method check     → POST only          → 405
+//  3. Content-type     → form-encoded only  → 400
+//  4. Origin check     → fail-closed if allowed_origins set → 403
+//  5. Rate limit       → token bucket per IP → 429
+//  6. Parse form       → r.ParseForm        → 413/400
+//  7. Honeypot check   → silent 200 if filled → 200 (silent)
+//  8. Required fields  → all required present and non-empty → 422
+//  9. Email format     → submitter email well-formed → 422
+//
+// 10. Render subject/body, transport.Send (with retries) → 200 or 502
+//
+// Submission lifecycle is logged at every decision point with a
+// per-request UUID submission_id (NFR8) and the endpoint path (FR15).
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	submissionID := log.SubmissionID()
+	logger := h.logger.With(
+		slog.String("submission_id", submissionID),
+		slog.String("endpoint", h.cfg.Path),
+		slog.String("transport", h.cfg.Transport.Type),
+	)
+
+	// Body size cap (FR7) — wrapped before any read so even malicious
+	// chunked-encoding senders can't exceed the cap. The actual rejection
+	// fires when ParseForm tries to read past the limit.
+	if h.maxBodySize > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, h.maxBodySize)
+	}
+
+	// Proof-of-browser challenge: a GET on a PoB-enabled endpoint issues a
+	// fresh token for the page JavaScript to fetch and inject (#45,
+	// ADR-18). Every other non-POST method is still 405.
+	if r.Method == http.MethodGet && h.pob != nil {
+		h.serveChallenge(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	apiMode := h.cfg.Auth == config.AuthAPIKey
+
+	// Determine the rate-limit bucket key. Form mode uses client IP (FR9).
+	// API mode uses the matched API key (FR35), which requires the auth
+	// check to run before the rate-limit gate.
+	var rateLimitKey string
+	var attachments []transport.Attachment // FR90: populated only on opted-in endpoints
+	if apiMode {
+		// FR34: parse Authorization: Bearer <key>; constant-time match
+		// against api_keys list (NFR19). Failed auth: 401 with no key
+		// material in logs (NFR21).
+		matched, ok := h.authenticateAPIRequest(r)
+		if !ok {
+			// Auth-failure brute-force defense: a per-IP token bucket
+			// consumes one token on each failed auth. Once the budget
+			// is exhausted, subsequent failures from that IP return
+			// 429 instead of 401. Successful auth never consumes from
+			// this budget, so legitimate callers are unaffected.
+			clientIP := ratelimit.ClientIP(r, h.trustedProxies)
+			if h.authFailLimiter != nil && !h.authFailLimiter.Allow(clientIP) {
+				attrs := []any{slog.Int64("latency_ms", time.Since(start).Milliseconds())}
+				if !h.cfg.StripClientIP {
+					attrs = append(attrs, slog.String("client_ip", clientIP))
+				}
+				logger.Info("auth_rate_limited", attrs...)
+				h.recorder.RateLimited(h.cfg.Path)
+				http.Error(w, "too many failed authentication attempts", http.StatusTooManyRequests)
+				return
+			}
+			logger.Info("auth_failed",
+				slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+			)
+			h.recorder.AuthFailed(h.cfg.Path)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		rateLimitKey = matched
+
+		// Idempotency check (FR40–FR44). The lookup runs before rate
+		// limit so a replay doesn't consume a token from the operator's
+		// rate-limit budget — the work is already done.
+		if idemKey := r.Header.Get("Idempotency-Key"); idemKey != "" {
+			if err := idempotency.ValidateKey(idemKey); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			cached, inFlight := h.idemCache.Lookup(idemKey)
+			if cached != nil {
+				logger.Info("idempotent_replay",
+					slog.String("idempotency_key", idemKey),
+					slog.Int("replayed_status", cached.Status),
+					slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+				)
+				h.recorder.IdempotentReplay(h.cfg.Path)
+				replayCachedResponse(w, cached)
+				return
+			}
+			if inFlight {
+				logger.Info("idempotent_conflict",
+					slog.String("idempotency_key", idemKey),
+					slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+				)
+				http.Error(w, "duplicate request in flight for this Idempotency-Key", http.StatusConflict)
+				return
+			}
+			if !h.idemCache.ClaimInFlight(idemKey) {
+				// Race lost between Lookup and ClaimInFlight — another
+				// goroutine claimed in between. Treat as in-flight (FR44).
+				logger.Info("idempotent_conflict",
+					slog.String("idempotency_key", idemKey),
+					slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+				)
+				http.Error(w, "duplicate request in flight for this Idempotency-Key", http.StatusConflict)
+				return
+			}
+			// Install a recording wrapper so the deferred Store can replay
+			// what we wrote. NFR20: cache the complete original response.
+			rw := &recordingResponseWriter{ResponseWriter: w}
+			w = rw
+			defer h.finalizeIdempotent(idemKey, rw)
+		}
+	} else {
+		// FR1: form-mode endpoints accept form-encoded bodies only.
+		if !isFormContentType(r.Header.Get("Content-Type")) {
+			http.Error(w, "form-encoded body required (application/x-www-form-urlencoded or multipart/form-data)", http.StatusBadRequest)
+			return
+		}
+
+		// Resolve the client IP once: it keys the rate limiter (form mode)
+		// and is the forensics field on every spam-check log line.
+		rateLimitKey = ratelimit.ClientIP(r, h.trustedProxies)
+
+		// Header-phase spam checks (FR6, NFR4). Run before the rate limiter
+		// so a rejection doesn't consume a token. Origin/Referer today;
+		// the pipeline holds any future header/IP checks.
+		for _, check := range h.headerChecks {
+			if h.applySpamVerdict(w, r, logger, check(r), rateLimitKey, submissionID, start) {
+				return
+			}
+		}
+	}
+
+	// Rate limit check (FR8). Bucket key differs by mode (set above).
+	if h.limiter != nil {
+		if !h.limiter.Allow(rateLimitKey) {
+			attrs := []any{slog.Int64("latency_ms", time.Since(start).Milliseconds())}
+			if !apiMode && !h.cfg.StripClientIP {
+				// NFR21: never log api-key values, even derived/truncated.
+				// Form mode logs client_ip for operator forensics — unless
+				// strip_client_ip is set (FR59 GDPR option).
+				attrs = append(attrs, slog.String("client_ip", rateLimitKey))
+			}
+			logger.Info("rate_limited", attrs...)
+			h.recorder.RateLimited(h.cfg.Path)
+			h.writeErrorResponse(w, r, http.StatusTooManyRequests, "rate limit exceeded")
+			return
+		}
+	}
+
+	// Body parse: form-mode reads form-encoded; api-mode reads JSON.
+	if apiMode {
+		// FR37: api-mode requires application/json. Form-encoded bodies
+		// (or anything else) get 415, not silently accepted.
+		if !isJSONContentType(r.Header.Get("Content-Type")) {
+			http.Error(w, "JSON body required (application/json)", http.StatusUnsupportedMediaType)
+			return
+		}
+		values, rawAttachments, err := parseJSONBody(r.Body)
+		if err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				logger.Info("body_too_large",
+					slog.Int64("limit_bytes", h.maxBodySize),
+					slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+				)
+				h.writeErrorResponse(w, r, http.StatusRequestEntityTooLarge,
+					fmt.Sprintf("request body too large (limit: %d bytes)", h.maxBodySize))
+				return
+			}
+			// API-shape violations authored by parseJSONBody are echoed
+			// (useful to the authenticated caller); raw decoder internals
+			// stay server-side and the client gets a generic 400 (#42).
+			// The log line always carries the full detail.
+			msg := "malformed request body"
+			var vis *clientVisibleError
+			if errors.As(err, &vis) {
+				msg = vis.msg
+			}
+			logger.Info("body_parse_failed",
+				slog.String("kind", "json"),
+				slog.String("reason", err.Error()),
+				slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+			)
+			h.writeErrorResponse(w, r, http.StatusBadRequest, msg)
+			return
+		}
+		r.Form = values
+		// FR90: api-mode attachments. Not opted in + present → 422; the
+		// caller configured a payload the endpoint won't honor, and
+		// silent dropping is the ADR-10 footgun.
+		if len(rawAttachments) > 0 && h.attachPolicy == nil {
+			h.recorder.ValidationFailed(h.cfg.Path)
+			response.WriteJSON(w, http.StatusUnprocessableEntity,
+				response.Validation(nil, map[string]string{
+					"attachments": "this endpoint does not accept attachments ([endpoints.attachments] not configured)",
+				}))
+			return
+		}
+		if h.attachPolicy != nil && len(rawAttachments) > 0 {
+			candidates, derr := decodeAPIAttachments(rawAttachments)
+			if derr != nil {
+				var vis *clientVisibleError
+				msg := "malformed attachments"
+				if errors.As(derr, &vis) {
+					msg = vis.msg
+				}
+				h.writeErrorResponse(w, r, http.StatusBadRequest, msg)
+				return
+			}
+			var vetOK bool
+			if attachments, vetOK = h.vetAttachments(w, r, candidates); !vetOK {
+				return
+			}
+		}
+	} else {
+		if err := h.parseFormBody(r); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				logger.Info("body_too_large",
+					slog.Int64("limit_bytes", h.maxBodySize),
+					slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+				)
+				h.writeErrorResponse(w, r, http.StatusRequestEntityTooLarge,
+					fmt.Sprintf("request body too large (limit: %d bytes)", h.maxBodySize))
+				return
+			}
+			// Generic 400; detail logged server-side (#42), see above.
+			logger.Info("body_parse_failed",
+				slog.String("kind", "form"),
+				slog.String("reason", err.Error()),
+				slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+			)
+			h.writeErrorResponse(w, r, http.StatusBadRequest, "malformed request body")
+			return
+		}
+		// FR90: form-mode file parts. Without the opt-in block, files
+		// are dropped exactly as v1.x. With it, they're read, sniffed,
+		// and vetted.
+		if h.attachPolicy != nil && r.MultipartForm != nil {
+			candidates, cerr := collectMultipartFiles(r)
+			if cerr != nil {
+				logger.Info("body_parse_failed",
+					slog.String("kind", "multipart-file"),
+					slog.String("reason", cerr.Error()),
+					slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+				)
+				h.writeErrorResponse(w, r, http.StatusBadRequest, "malformed request body")
+				return
+			}
+			var vetOK bool
+			if attachments, vetOK = h.vetAttachments(w, r, candidates); !vetOK {
+				return
+			}
+		}
+	}
+
+	// Honeypot check (FR5) — silent 200 if triggered so bots can't
+	// distinguish honeypot rejection from success. The response body
+	// mirrors the real success path's shape (status + submission_id)
+	// for the same reason: an observant bot inspecting the body must
+	// not be able to tell the two paths apart. Form mode only — API
+	// mode is authenticated and has no browser bots.
+	// Form-phase spam checks (form mode only): honeypot (silent 200) and
+	// CSRF (403, logged as csrf_rejected), plus any future post-parse
+	// checks (content-shape, reputation, captcha). Each flows through the
+	// same verdict mapping.
+	if !apiMode {
+		for _, check := range h.formChecks {
+			if h.applySpamVerdict(w, r, logger, check(r.Context(), r.Form, rateLimitKey), rateLimitKey, submissionID, start) {
+				return
+			}
+		}
+	}
+
+	// Validation: required fields + email format (FR8, FR9).
+	missing := validate.RequiredFields(r.Form, h.cfg.Required)
+	fieldErrors := map[string]string{}
+	if v := strings.TrimSpace(r.Form.Get(h.emailField)); v != "" && !validate.Email(v) {
+		fieldErrors[h.emailField] = "invalid email format"
+	}
+	if len(missing) > 0 || len(fieldErrors) > 0 {
+		failedFields := append([]string{}, missing...)
+		for f := range fieldErrors {
+			failedFields = append(failedFields, f)
+		}
+		logger.Info("validation_failed",
+			slog.Any("fields", failedFields),
+			slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+		)
+		h.recorder.ValidationFailed(h.cfg.Path)
+		h.writeValidationErrorResponse(w, r, response.Validation(missing, fieldErrors))
+		return
+	}
+
+	logger.Info("submission_received")
+	h.recorder.Submitted(h.cfg.Path)
+
+	// Render subject and body templates against form fields (FR12, FR13).
+	subject, err := h.renderer.RenderSubject(r.Form)
+	if err != nil {
+		logger.Error("template_render_failed", slog.String("error", err.Error()))
+		http.Error(w, "submission could not be processed", http.StatusInternalServerError)
+		return
+	}
+	var body, bodyHTML string
+	if h.renderer.HTML() {
+		// FR72: HTML endpoints produce both multipart parts.
+		bodyHTML, body, err = h.renderer.RenderBodyHTML(r.Form)
+	} else {
+		body, err = h.renderer.RenderBody(r.Form)
+	}
+	if err != nil {
+		logger.Error("template_render_failed", slog.String("error", err.Error()))
+		http.Error(w, "submission could not be processed", http.StatusInternalServerError)
+		return
+	}
+
+	// FR46: per-request to_override (api-mode only). Absent → use cfg.To;
+	// present but invalid → 422. Each entry passes the same email-syntax
+	// check as form-mode submissions (FR11 reuse). Form mode ignores any
+	// "to_override" form field — recipients are operator-controlled there
+	// by design (ADR-11).
+	toAddresses := h.cfg.To
+	if apiMode {
+		if override, present := r.Form[toOverrideField]; present {
+			if len(override) == 0 {
+				response.WriteJSON(w, http.StatusUnprocessableEntity,
+					response.Validation(nil, map[string]string{
+						toOverrideField: "must contain at least one address",
+					}))
+				return
+			}
+			validated := make([]string, 0, len(override))
+			invalid := []string{}
+			for _, addr := range override {
+				trimmed := strings.TrimSpace(addr)
+				if !validate.Email(trimmed) {
+					invalid = append(invalid, addr)
+					continue
+				}
+				validated = append(validated, trimmed)
+			}
+			if len(invalid) > 0 {
+				response.WriteJSON(w, http.StatusUnprocessableEntity,
+					response.Validation(nil, map[string]string{
+						toOverrideField: fmt.Sprintf("invalid email address(es): %v", invalid),
+					}))
+				return
+			}
+			toAddresses = validated
+		}
+	}
+
+	msg := transport.Message{
+		From:         h.cfg.From,
+		To:           toAddresses,
+		Subject:      subject,
+		BodyText:     body,
+		BodyHTML:     bodyHTML,
+		SubmissionID: submissionID,
+		Fields:       storableFields(r.Form, h.cfg.Honeypot),
+		Attachments:  attachments,
+	}
+
+	// Reply-To header (PRD Open Question 4): when the operator names a
+	// form field via reply_to_email_field, or leaves it unset (defaulting
+	// to h.emailField), and the submission provides a value that passes
+	// the email syntax check, set Reply-To. Otherwise leave it empty so
+	// the receiver replies to the `from` address — the safe default.
+	replyToField := h.cfg.ReplyToEmailField
+	if replyToField == "" {
+		replyToField = h.emailField
+	}
+	if v := strings.TrimSpace(r.Form.Get(replyToField)); v != "" && validate.Email(v) {
+		msg.ReplyTo = v
+	}
+
+	// FR56: dry-run mode. Short-circuit before transport.Send and return
+	// the prepared Message so operators can debug template rendering and
+	// recipient resolution without sending mail. The idempotency cache
+	// treats this as a normal 200 (cacheable per the deferred Store).
+	if h.cfg.DryRun {
+		logger.Info("submission_dry_run",
+			slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+		)
+		response.WriteJSON(w, http.StatusOK, response.DryRun{
+			Status:       "dry_run",
+			SubmissionID: submissionID,
+			PreparedMessage: response.PreparedMessage{
+				From:     msg.From,
+				To:       msg.To,
+				ReplyTo:  msg.ReplyTo,
+				Subject:  msg.Subject,
+				BodyText: msg.BodyText,
+				BodyHTML: msg.BodyHTML,
+			},
+		})
+		return
+	}
+
+	// FR86: drop suppressed recipients before the send. All suppressed →
+	// terminally handled as "suppressed", nothing sent. Lookup failures
+	// fail open (send anyway) — mail first, NFR27.
+	var suppressed map[string]string
+	msg.To, suppressed = h.filterSuppressed(msg.To)
+	if len(suppressed) > 0 {
+		h.recorder.Suppressed(h.cfg.Path, len(suppressed))
+		logger.Info("recipients_suppressed", slog.Int("count", len(suppressed)))
+	}
+	if len(msg.To) == 0 {
+		h.recordSuppressedSubmission(submissionID, msg, r)
+		logger.Info("submission_suppressed",
+			slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+		)
+		h.writeSuccessResponse(w, r, response.Success{
+			Status:       "suppressed",
+			SubmissionID: submissionID,
+			Suppressed:   suppressed,
+		})
+		return
+	}
+
+	// FR77: persist the submission (status "sending") before the send so
+	// a crash mid-send is recoverable (NFR28). Best-effort: a storage
+	// failure degrades, never blocks (NFR27).
+	persisted, queueable := h.recordSubmission(submissionID, msg, r)
+
+	// Send with retry policy (FR19-22) under the request hard timeout.
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	result, err := transport.SendWithRetry(ctx, h.transport, msg, logger)
+	if err != nil {
+		// FR78/ADR-21: transient exhaustion with storage available moves
+		// the submission to the background queue instead of dropping it.
+		// Terminal errors never queue — retrying them is noise.
+		if queueable && transport.IsRetryable(err) {
+			if qerr := h.storageGate.Store().Enqueue(submissionID, time.Now()); qerr != nil {
+				h.storageGate.ReportError(qerr)
+			} else {
+				logger.Warn("submission_queued",
+					slog.String("error", err.Error()),
+					slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+				)
+				h.recorder.Queued(h.cfg.Path, h.cfg.Transport.Type)
+				body := response.Success{Status: "queued", SubmissionID: submissionID}
+				if apiMode {
+					// Machine callers can distinguish accepted-later
+					// from sent; 2xx = terminally handled either way.
+					response.WriteJSON(w, http.StatusAccepted, body)
+				} else {
+					// A human submitter can't act on "queued"; Posthorn
+					// is now retrying, which beats v1.x's drop.
+					h.writeSuccessResponse(w, r, body)
+				}
+				return
+			}
+		}
+
+		if persisted {
+			if serr := h.storageGate.Store().MarkStatus(submissionID, storage.StatusFailed, err.Error()); serr != nil {
+				h.storageGate.ReportError(serr)
+			}
+		}
+
+		// Terminal failure — log payload (or just metadata if operator
+		// disabled it) so operators can recover from logs (FR16).
+		if h.logFailedSubmissions {
+			logger.Error("submission_failed",
+				slog.String("error", err.Error()),
+				slog.Any("form", redactedForm(r.Form, h.cfg.Honeypot)),
+				slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+			)
+		} else {
+			logger.Error("submission_failed",
+				slog.String("error", err.Error()),
+				slog.Any("form_fields", formFieldNames(r.Form)),
+				slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+			)
+		}
+		h.recorder.Failed(h.cfg.Path, h.cfg.Transport.Type, errorClassName(err))
+		http.Error(w, "submission could not be delivered", http.StatusBadGateway)
+		return
+	}
+
+	if persisted {
+		if serr := h.storageGate.Store().MarkSent(submissionID, result.MessageID, time.Now()); serr != nil {
+			h.storageGate.ReportError(serr)
+		}
+	}
+
+	latency := time.Since(start)
+	sentAttrs := []any{
+		slog.Int64("latency_ms", latency.Milliseconds()),
+	}
+	if result.MessageID != "" {
+		sentAttrs = append(sentAttrs, slog.String("transport_message_id", result.MessageID))
+	}
+	logger.Info("submission_sent", sentAttrs...)
+	h.recorder.Sent(h.cfg.Path, h.cfg.Transport.Type, latency)
+	h.writeSuccessResponse(w, r, response.Success{
+		Status:       "ok",
+		SubmissionID: submissionID,
+		Suppressed:   suppressed,
+	})
+}
+
+// filterSuppressed splits recipients into sendable and suppressed
+// (FR86). Without storage, or degraded, everything is sendable — the
+// v1.x path untouched. Lookup errors fail open per-recipient.
+func (h *Handler) filterSuppressed(to []string) (remaining []string, suppressed map[string]string) {
+	g := h.storageGate
+	if g == nil || !g.Healthy() {
+		return to, nil
+	}
+	remaining = make([]string, 0, len(to))
+	for _, addr := range to {
+		sup, ok, err := g.Store().SuppressionFor(addr)
+		if err != nil {
+			g.ReportError(err)
+			remaining = append(remaining, addr)
+			continue
+		}
+		if ok {
+			if suppressed == nil {
+				suppressed = map[string]string{}
+			}
+			suppressed[addr] = sup.Reason
+			continue
+		}
+		remaining = append(remaining, addr)
+	}
+	return remaining, suppressed
+}
+
+// recordSuppressedSubmission logs an all-recipients-suppressed
+// submission (status "suppressed", FR86) in the submission log.
+func (h *Handler) recordSuppressedSubmission(id string, msg transport.Message, r *http.Request) {
+	g := h.storageGate
+	if g == nil || !g.Healthy() {
+		return
+	}
+	sub := storage.Submission{
+		ID:        id,
+		Endpoint:  h.cfg.Path,
+		Transport: h.cfg.Transport.Type,
+		Status:    storage.StatusSuppressed,
+		CreatedAt: time.Now(),
+	}
+	if h.logFailedSubmissions {
+		sub.From = msg.From
+		sub.Subject = msg.Subject
+		sub.BodyText = msg.BodyText
+		sub.BodyHTML = msg.BodyHTML
+		sub.Fields = storableFields(r.Form, h.cfg.Honeypot)
+		if !h.cfg.StripClientIP {
+			sub.ClientIP = ratelimit.ClientIP(r, h.trustedProxies)
+		}
+	}
+	if err := g.Store().RecordSubmission(sub); err != nil {
+		g.ReportError(err)
+	}
+}
+
+// AttachStorage wires the optional storage gate (FR76). Called by
+// cmd/posthorn when a [storage] block is configured; tests attach
+// in-memory gates directly. Nil-safe: without it the handler is v1.x.
+//
+// For api-mode endpoints it also swaps the idempotency backend to the
+// storage-backed Durable (FR81, the ADR-8 seam): same contract, same
+// TTL, restart-survivable. idempotency_cache_size is a capacity for the
+// in-memory backend and is ignored by the durable one.
+func (h *Handler) AttachStorage(gate *storage.Gate) {
+	h.storageGate = gate
+	if h.cfg.Auth == config.AuthAPIKey {
+		h.idemCache = idempotency.NewDurable(gate, h.cfg.Path, idempotency.DefaultTTL)
+	}
+}
+
+// recordSubmission persists the pre-send row (FR77). Returns whether a
+// row was written and whether this submission may enter the retry queue
+// on transient exhaustion. Endpoints with log_failed_submissions =
+// false record metadata only and are never queue-eligible — the
+// operator said "don't persist submitter content on failure," and the
+// queue is exactly that (ADR-21).
+func (h *Handler) recordSubmission(id string, msg transport.Message, r *http.Request) (persisted, queueable bool) {
+	g := h.storageGate
+	if g == nil || !g.Healthy() {
+		return false, false
+	}
+	sub := storage.Submission{
+		ID:        id,
+		Endpoint:  h.cfg.Path,
+		Transport: h.cfg.Transport.Type,
+		Status:    storage.StatusSending,
+		CreatedAt: time.Now(),
+	}
+	if h.logFailedSubmissions {
+		queueable = true
+		sub.From = msg.From
+		sub.ToAddrs = msg.To
+		sub.ReplyTo = msg.ReplyTo
+		sub.Subject = msg.Subject
+		sub.BodyText = msg.BodyText
+		sub.BodyHTML = msg.BodyHTML
+		sub.Fields = msg.Fields
+		for _, a := range msg.Attachments {
+			sub.Attachments = append(sub.Attachments, storage.Attachment{
+				Filename: a.Filename, ContentType: a.ContentType, Data: a.Data,
+			})
+		}
+		if !h.cfg.StripClientIP {
+			sub.ClientIP = ratelimit.ClientIP(r, h.trustedProxies)
+		}
+	}
+	if err := g.Store().RecordSubmission(sub); err != nil {
+		g.ReportError(err)
+		return false, false
+	}
+	return true, queueable
+}
+
+// storableFields is the raw-fields column content (FR77): the submitted
+// form minus structural token fields, with the honeypot value redacted
+// (same posture as the failure log).
+func storableFields(form map[string][]string, honeypot string) map[string][]string {
+	out := redactedForm(form, honeypot)
+	for _, structural := range []string{csrf.TokenField, pobTokenField, turnstileField, toOverrideField} {
+		delete(out, structural)
+	}
+	return out
+}
+
+// writeSuccessResponse emits a 200 response. When `redirect_success` is
+// configured on the endpoint AND the request's Accept header prefers HTML
+// (browser form submit), Posthorn returns a 303 See Other to that URL
+// instead of the JSON body. JSON is the fallback. Form-mode only — api-mode
+// endpoints reject `redirect_success` at config-parse time.
+func (h *Handler) writeSuccessResponse(w http.ResponseWriter, r *http.Request, body response.Success) {
+	if h.cfg.RedirectSuccess != "" && response.Negotiate(r.Header.Get("Accept"), true) == response.ModeRedirect {
+		http.Redirect(w, r, h.cfg.RedirectSuccess, http.StatusSeeOther)
+		return
+	}
+	response.WriteJSON(w, http.StatusOK, body)
+}
+
+// writeErrorResponse emits a plaintext error response, optionally
+// redirecting to `redirect_error` when the request prefers HTML. Used for
+// the user-facing 4xx paths (403, 413, 429) where a browser form submit
+// benefits from landing on an error page rather than seeing raw plaintext.
+func (h *Handler) writeErrorResponse(w http.ResponseWriter, r *http.Request, status int, message string) {
+	if h.cfg.RedirectError != "" && response.Negotiate(r.Header.Get("Accept"), true) == response.ModeRedirect {
+		http.Redirect(w, r, h.cfg.RedirectError, http.StatusSeeOther)
+		return
+	}
+	http.Error(w, message, status)
+}
+
+// writeValidationErrorResponse emits a 422 validation response with the
+// field-error JSON body, or redirects to `redirect_error` when the request
+// prefers HTML and a redirect URL is configured.
+func (h *Handler) writeValidationErrorResponse(w http.ResponseWriter, r *http.Request, body response.Error) {
+	if h.cfg.RedirectError != "" && response.Negotiate(r.Header.Get("Accept"), true) == response.ModeRedirect {
+		http.Redirect(w, r, h.cfg.RedirectError, http.StatusSeeOther)
+		return
+	}
+	response.WriteJSON(w, http.StatusUnprocessableEntity, body)
+}
+
+// recordingResponseWriter wraps an http.ResponseWriter to capture the
+// status code, body bytes, and Content-Type header so an idempotent
+// request's response can be stored verbatim for replay (NFR20). All
+// methods pass through to the underlying writer.
+type recordingResponseWriter struct {
+	http.ResponseWriter
+	status        int
+	contentType   string
+	body          bytes.Buffer
+	headerWritten bool
+}
+
+func (r *recordingResponseWriter) WriteHeader(code int) {
+	if r.headerWritten {
+		return
+	}
+	r.headerWritten = true
+	r.status = code
+	r.contentType = r.ResponseWriter.Header().Get("Content-Type")
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *recordingResponseWriter) Write(b []byte) (int, error) {
+	if !r.headerWritten {
+		// Match net/http's implicit 200 behavior — Write without a
+		// preceding WriteHeader is a 200.
+		r.WriteHeader(http.StatusOK)
+	}
+	r.body.Write(b)
+	return r.ResponseWriter.Write(b)
+}
+
+// finalizeIdempotent runs in the request-handling defer to either Store
+// the captured response under idemKey or Abandon the in-flight claim.
+//
+// Cache policy: 2xx and 422 (deterministic validation failures) get
+// stored. Everything else (4xx-non-422, 429, 5xx, no-status-written)
+// abandons so the next caller retries fresh. 429 rate-limit and 5xx
+// transport-failure responses are transient by nature; caching them
+// would freeze a stale answer for 24h.
+func (h *Handler) finalizeIdempotent(idemKey string, rw *recordingResponseWriter) {
+	cacheable := rw.status == http.StatusOK || rw.status == http.StatusUnprocessableEntity
+	if !cacheable {
+		h.idemCache.Abandon(idemKey)
+		return
+	}
+	h.idemCache.Store(idemKey, idempotency.Response{
+		Status:      rw.status,
+		Body:        rw.body.Bytes(),
+		ContentType: rw.contentType,
+	})
+}
+
+// errorClassName extracts the ErrorClass.String() value from a transport
+// error so it can be used as a metric label. Returns "unknown" when the
+// error isn't a *transport.TransportError (which would be a contract bug
+// from a transport implementation).
+func errorClassName(err error) string {
+	var te *transport.TransportError
+	if errors.As(err, &te) {
+		return te.Class.String()
+	}
+	return "unknown"
+}
+
+// replayCachedResponse writes a previously-stored idempotent response
+// back to the caller byte-for-byte (NFR20).
+func replayCachedResponse(w http.ResponseWriter, r *idempotency.Response) {
+	if r.ContentType != "" {
+		w.Header().Set("Content-Type", r.ContentType)
+	}
+	w.WriteHeader(r.Status)
+	_, _ = w.Write(r.Body)
+}
+
+// authenticateAPIRequest extracts the Bearer token from r's Authorization
+// header and matches it against the endpoint's configured api_keys using
+// constant-time comparison (NFR19). Returns the matched key on success
+// (callers use it as the rate-limit bucket key per FR35) and a boolean
+// indicating whether any key matched.
+//
+// The matched key MUST NOT be returned in HTTP responses, written to logs,
+// or exposed in error messages (NFR21). The caller's responsibility is to
+// use the returned key only as opaque bucket identity.
+func (h *Handler) authenticateAPIRequest(r *http.Request) (string, bool) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		return "", false
+	}
+	// RFC 6750 §2.1: scheme name is case-insensitive ("Bearer" / "bearer"
+	// / "BEARER" all valid). Token portion is opaque, no whitespace
+	// tolerance beyond the single separator space.
+	const prefix = "Bearer "
+	if len(authHeader) <= len(prefix) || !strings.EqualFold(authHeader[:len(prefix)], prefix) {
+		return "", false
+	}
+	token := authHeader[len(prefix):]
+	if token == "" {
+		return "", false
+	}
+
+	tokenBytes := []byte(token)
+	var matched string
+	// Iterate every configured key regardless of early match. Returning
+	// on the first match would reveal via timing which position in the
+	// api_keys list matched. ConstantTimeCompare itself is constant-time
+	// for equal-length inputs (and returns 0 quickly for length mismatch,
+	// which leaks key length only — acceptable since operators choose
+	// their key shapes).
+	for _, k := range h.cfg.APIKeys {
+		if subtle.ConstantTimeCompare(tokenBytes, []byte(k)) == 1 {
+			matched = k
+		}
+	}
+	return matched, matched != ""
+}
+
+// redactedForm returns a copy of the form with the honeypot field
+// redacted so terminal-failure logs don't immortalize spam payloads
+// in operator logs. Non-honeypot fields pass through verbatim — the
+// whole point of FR16 is letting the operator recover the submission
+// from logs.
+func redactedForm(form map[string][]string, honeypot string) map[string][]string {
+	if len(form) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(form))
+	for k, v := range form {
+		if k == honeypot && honeypot != "" {
+			out[k] = []string{"<redacted>"}
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// formFieldNames returns just the keys of a form. Used when
+// log_failed_submissions=false — operator wants to know SOMETHING
+// happened but not retain submitter content.
+func formFieldNames(form map[string][]string) []string {
+	if len(form) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(form))
+	for k := range form {
+		names = append(names, k)
+	}
+	return names
+}
+
+// isFormContentType returns true if the Content-Type header indicates a
+// form-encoded body. Both application/x-www-form-urlencoded and
+// multipart/form-data are accepted (FR1).
+func isFormContentType(ct string) bool {
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	ct = strings.TrimSpace(strings.ToLower(ct))
+	return ct == "application/x-www-form-urlencoded" || ct == "multipart/form-data"
+}
+
+// isJSONContentType returns true if the Content-Type header indicates a
+// JSON body. Used on api-mode endpoints (FR37). Parameters after `;` (e.g.
+// `; charset=utf-8`) are tolerated.
+func isJSONContentType(ct string) bool {
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	ct = strings.TrimSpace(strings.ToLower(ct))
+	return ct == "application/json"
+}
+
+// clientVisibleError marks a body-parse error whose message is authored
+// by this package (an API-shape violation like a nested object) and is
+// safe and useful to echo to the authenticated API caller. Raw decoder
+// errors from the stdlib are NOT wrapped in this type and stay
+// server-side — the client gets a generic 400 (#42).
+type clientVisibleError struct{ msg string }
+
+func (e *clientVisibleError) Error() string { return e.msg }
+
+// parseFormBody parses the request body for form-mode. multipart/form-data
+// goes through ParseMultipartForm — plain ParseForm silently ignores
+// multipart bodies (their fields never reached the pipeline before
+// v2.0; found and fixed during Story 17.1). The 4MB threshold is the
+// in-memory limit before file parts spill to disk; the request body as
+// a whole is already bounded by MaxBytesReader.
+func (h *Handler) parseFormBody(r *http.Request) error {
+	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if ct == "multipart/form-data" {
+		return r.ParseMultipartForm(4 << 20)
+	}
+	return r.ParseForm()
+}
+
+// vetAttachments enforces the endpoint's attachment policy and writes
+// the 422 response on violation (FR91). Returns ok=false when a
+// response was written.
+func (h *Handler) vetAttachments(w http.ResponseWriter, r *http.Request, candidates []transport.Attachment) ([]transport.Attachment, bool) {
+	accepted, violations := h.attachPolicy.vet(candidates)
+	if len(violations) == 0 {
+		return accepted, true
+	}
+	fieldErrors := make(map[string]string, len(violations))
+	for _, v := range violations {
+		fieldErrors[v.Name] = v.Reason
+	}
+	h.recorder.ValidationFailed(h.cfg.Path)
+	h.writeValidationErrorResponse(w, r, response.Validation(nil, fieldErrors))
+	return nil, false
+}
+
+// parseJSONBody decodes a JSON object request body into a url.Values map,
+// matching the shape produced by r.ParseForm so the downstream validation,
+// templating, and transport pipeline can be ingress-agnostic (FR36, FR38,
+// FR39).
+//
+// Coercion rules (architecture doc Open Q5):
+//   - String values pass through as single-element slices.
+//   - Booleans and numbers coerce to their string representation via
+//     strconv. JSON numbers decode as float64; integers in the safe range
+//     format without a decimal point.
+//   - null values are omitted (treated as absent — matches form-mode where
+//     an unset field never appears in r.Form).
+//   - Arrays of primitives become multi-element slices (parallel to
+//     form-mode multi-value fields like `name=a&name=b`).
+//   - Nested objects, top-level non-object bodies, and arrays containing
+//     non-primitives are rejected with a clear error (HTTP 400 via caller).
+//
+// The "attachments" key is structural as of v2.0 (FR90): an array of
+// {filename, content_type, data} objects returned separately, never a
+// template field. Endpoints without the attachments opt-in reject
+// requests carrying it (422, in the caller).
+func parseJSONBody(body io.Reader) (url.Values, []apiAttachment, error) {
+	raw := make(map[string]any)
+	dec := json.NewDecoder(body)
+	if err := dec.Decode(&raw); err != nil {
+		return nil, nil, err
+	}
+	// Reject trailing content after the top-level object — e.g. `{"a":1}{"b":2}`
+	// or `{}garbage`. dec.More() reports whether the decoder has more JSON
+	// values to consume from the stream.
+	if dec.More() {
+		return nil, nil, &clientVisibleError{"unexpected trailing content after top-level JSON object"}
+	}
+
+	var attachments []apiAttachment
+	if rawAtt, present := raw[attachmentsField]; present {
+		delete(raw, attachmentsField)
+		reencoded, err := json.Marshal(rawAtt)
+		if err != nil {
+			return nil, nil, &clientVisibleError{"attachments: unencodable value"}
+		}
+		if err := json.Unmarshal(reencoded, &attachments); err != nil {
+			return nil, nil, &clientVisibleError{`attachments: must be an array of {"filename", "content_type", "data"} objects`}
+		}
+	}
+
+	out := make(url.Values, len(raw))
+	for k, v := range raw {
+		switch val := v.(type) {
+		case nil:
+			// Omit: matches "form field never submitted" semantics.
+		case string:
+			out[k] = []string{val}
+		case bool:
+			out[k] = []string{strconv.FormatBool(val)}
+		case float64:
+			out[k] = []string{formatJSONNumber(val)}
+		case []any:
+			strs, err := coerceJSONArray(k, val)
+			if err != nil {
+				return nil, nil, err
+			}
+			out[k] = strs
+		case map[string]any:
+			return nil, nil, &clientVisibleError{fmt.Sprintf("nested objects are not supported in v1.1 (field %q is an object)", k)}
+		default:
+			return nil, nil, &clientVisibleError{fmt.Sprintf("unsupported JSON type for field %q: %T", k, v)}
+		}
+	}
+	return out, attachments, nil
+}
+
+// coerceJSONArray handles []any values from json.Unmarshal — converts
+// every element to a string. Nested arrays and objects are rejected
+// (consistent with the top-level "no nested objects" rule).
+func coerceJSONArray(field string, arr []any) ([]string, error) {
+	out := make([]string, 0, len(arr))
+	for i, v := range arr {
+		switch val := v.(type) {
+		case nil:
+			out = append(out, "")
+		case string:
+			out = append(out, val)
+		case bool:
+			out = append(out, strconv.FormatBool(val))
+		case float64:
+			out = append(out, formatJSONNumber(val))
+		default:
+			return nil, &clientVisibleError{fmt.Sprintf("field %q[%d]: nested arrays and objects are not supported in v1.1", field, i)}
+		}
+	}
+	return out, nil
+}
+
+// formatJSONNumber renders a JSON number (always float64 from
+// json.Unmarshal) as a compact string. Integer-valued floats render
+// without a trailing ".0".
+func formatJSONNumber(f float64) string {
+	// FormatFloat with -1 precision uses the shortest representation that
+	// round-trips. Integer values come out without a decimal point.
+	return strconv.FormatFloat(f, 'f', -1, 64)
+}

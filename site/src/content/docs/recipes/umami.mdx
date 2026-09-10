@@ -1,0 +1,245 @@
+---
+title: Weekly Umami analytics digest via Posthorn API mode
+description: Send yourself a weekly traffic summary from a self-hosted Umami instance. A small cron job queries Umami's API, posts to Posthorn's API mode with an idempotency key, and Posthorn renders and sends the email through your transactional provider.
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+
+You're running [Umami](https://umami.is) for self-hosted privacy-friendly analytics. Umami's web UI shows you traffic stats whenever you log in, but it has no built-in email reports in the self-hosted version. You want a Monday-morning digest of last week's pageviews and visitors landing in your inbox without logging in.
+
+The pattern: a small cron job queries Umami's stats API, formats the numbers as a JSON payload, and POSTs to a Posthorn [API-mode](/features/api-mode/) endpoint. Posthorn templates the payload into an email and sends it through your transactional provider. The cron job runs on the Docker host (or anywhere with network access to both Umami and Posthorn). It's about 20 lines of bash.
+
+**At the end:** a weekly cron job that emails you a digest like the one below, with a per-week [idempotency key](/features/api-mode/#idempotency) so re-runs don't duplicate the message.
+
+```text
+Subject: Weekly Umami digest for example.com (2026-W22)
+
+Pageviews:    12,847
+Visitors:     3,201
+Visits:       4,886
+Bounce rate:  41.2%
+Avg time:     1m 38s
+```
+
+## Why this beats Umami's nonexistent built-in mailer
+
+Self-hosted Umami (verified against v3.1.0) does not ship a built-in SMTP client. Issue [#920](https://github.com/umami-software/umami/issues/920) on the Umami repo asked for periodic email summaries; it was closed in 2023 with the maintainer pointing users at external automation. This recipe is that external automation, but with Posthorn doing the rendering and delivery instead of forcing the cron script to hold provider credentials.
+
+- **One credential.** The Postmark / Resend / Mailgun / SES key lives in Posthorn's config, not in the cron script's environment. The cron script holds a Posthorn API key (rotatable independently).
+- **Idempotency keys built in.** Using the ISO week as the key (e.g., `2026-W22`) means a re-run later the same week returns the cached response instead of sending the email twice.
+- **Templating in one place.** The email subject and body live in `posthorn.toml`, not in shell-escape hell inside the cron script.
+
+## The shape
+
+```d2
+shape: sequence_diagram
+
+cron: "Cron job\n(host or container)"
+umami: Umami
+posthorn: "Posthorn\n(API mode)"
+provider: "Postmark · Resend\nMailgun · SES"
+
+cron -> umami: "POST /api/auth/login"
+umami -> cron: "{ token }"
+
+cron -> umami: "GET /api/websites/{id}/stats\n(Authorization: Bearer)"
+umami -> cron: "{ pageviews, visitors, … }"
+
+cron -> posthorn: "POST /api/weekly-digest\nIdempotency-Key: 2026-W22"
+posthorn -> provider: HTTPS
+posthorn -> cron: "{ status: ok, submission_id }"
+```
+
+The cron job runs on whatever schedule you want (Monday 8am is the conventional choice). Posthorn's API-mode endpoint authenticates the cron job's request via Bearer token, validates and templates the JSON body, then dispatches the email through whichever transport is configured.
+
+## Prerequisites
+
+- A running self-hosted Umami instance, reachable from wherever the cron job will run
+- Posthorn running with an HTTP listener (the API-mode endpoint will live on this listener; doesn't matter if it's loopback-only behind a reverse proxy or directly exposed)
+- A transactional mail provider account (Postmark, Resend, Mailgun, or AWS SES) with a verified sending domain
+- The Umami **website ID** of the site you want to track (visible in Umami's dashboard URL: `/websites/{id}` is what you want)
+- `curl` and `jq` available on the host running the cron job
+
+## Walkthrough
+
+<Steps>
+
+1. **Add an API-mode endpoint to `posthorn.toml`.**
+
+   ```toml
+   [[endpoints]]
+   path = "/api/weekly-digest"
+   auth = "api-key"
+   api_keys = ["${env.POSTHORN_DIGEST_KEY}"]
+   to = ["you@example.com"]
+   from = "Umami Digest <noreply@example.com>"
+   required = ["pageviews", "visitors", "visits", "bounce_rate", "avg_time", "iso_week"]
+   subject = "Weekly Umami digest for example.com ({{.iso_week}})"
+   body = """
+   Pageviews:    {{.pageviews}}
+   Visitors:     {{.visitors}}
+   Visits:       {{.visits}}
+   Bounce rate:  {{.bounce_rate}}%
+   Avg time:     {{.avg_time}}
+
+   Period: last 7 days (ending {{.iso_week}}).
+   """
+   idempotency_cache_size = 16   # plenty for weekly cadence
+
+   [endpoints.transport]
+   type = "postmark"
+
+   [endpoints.transport.settings]
+   api_key = "${env.POSTMARK_API_KEY}"
+   ```
+
+   `auth = "api-key"` puts this endpoint in [API mode](/features/api-mode/): JSON body only, Bearer-token auth, [idempotency keys](/features/api-mode/#idempotency), no honeypot / Origin / CSRF gates. Restart Posthorn after the edit.
+
+   Add the API key to your `.env`:
+
+   ```bash
+   POSTHORN_DIGEST_KEY=generate-a-long-random-string-here
+   POSTMARK_API_KEY=your-postmark-server-token
+   ```
+
+   Generate the digest key with `openssl rand -base64 32` or similar.
+
+2. **Write the cron script.**
+
+   Save as `/usr/local/bin/umami-digest.sh` (or anywhere on `$PATH`):
+
+   ```bash
+   #!/usr/bin/env bash
+   set -euo pipefail
+
+   # Required env vars (set in the cron environment or sourced from a file):
+   #   UMAMI_URL          e.g. http://umami:3000  (or https://umami.example.com)
+   #   UMAMI_USERNAME     Umami admin user
+   #   UMAMI_PASSWORD     Umami admin password
+   #   UMAMI_WEBSITE_ID   UUID of the tracked site
+   #   POSTHORN_URL       e.g. http://posthorn:8080  (or https://posthorn.example.com)
+   #   POSTHORN_API_KEY   Bearer token for /api/weekly-digest
+
+   # 1. Log in to Umami; capture the bearer token.
+   TOKEN=$(curl -sf -X POST "$UMAMI_URL/api/auth/login" \
+     -H 'Content-Type: application/json' \
+     -d "{\"username\":\"$UMAMI_USERNAME\",\"password\":\"$UMAMI_PASSWORD\"}" \
+     | jq -r .token)
+
+   # 2. Compute the window: last 7 days, in Unix milliseconds.
+   END=$(date -u +%s)000
+   START=$(date -u -d '7 days ago' +%s)000
+   ISO_WEEK=$(date -u +%G-W%V)
+
+   # 3. Pull stats from Umami.
+   STATS=$(curl -sf "$UMAMI_URL/api/websites/$UMAMI_WEBSITE_ID/stats?startAt=$START&endAt=$END" \
+     -H "Authorization: Bearer $TOKEN")
+
+   PAGEVIEWS=$(echo  "$STATS" | jq -r '.pageviews.value // .pageviews')
+   VISITORS=$(echo   "$STATS" | jq -r '.visitors.value  // .visitors')
+   VISITS=$(echo     "$STATS" | jq -r '.visits.value    // .visits')
+   BOUNCES=$(echo    "$STATS" | jq -r '.bounces.value   // .bounces')
+   TOTALTIME=$(echo  "$STATS" | jq -r '.totaltime.value // .totaltime')
+
+   # Derive bounce rate and average visit time.
+   BOUNCE_RATE=$(awk "BEGIN { if ($VISITS > 0) printf \"%.1f\", ($BOUNCES * 100.0) / $VISITS; else print \"0.0\" }")
+   AVG_TIME=$(awk "BEGIN { if ($VISITS > 0) { t = $TOTALTIME / $VISITS; m = int(t/60); s = int(t%60); printf \"%dm %ds\", m, s } else print \"0m 0s\" }")
+
+   # 4. POST to Posthorn with this week's ISO date as the idempotency key.
+   curl -sf -X POST "$POSTHORN_URL/api/weekly-digest" \
+     -H "Authorization: Bearer $POSTHORN_API_KEY" \
+     -H "Idempotency-Key: $ISO_WEEK" \
+     -H 'Content-Type: application/json' \
+     -d "$(jq -n \
+       --argjson pageviews "$PAGEVIEWS" \
+       --argjson visitors "$VISITORS" \
+       --argjson visits "$VISITS" \
+       --arg bounce_rate "$BOUNCE_RATE" \
+       --arg avg_time "$AVG_TIME" \
+       --arg iso_week "$ISO_WEEK" \
+       '{pageviews:$pageviews, visitors:$visitors, visits:$visits, bounce_rate:$bounce_rate, avg_time:$avg_time, iso_week:$iso_week}')"
+
+   echo "sent digest for $ISO_WEEK"
+   ```
+
+   Make it executable: `chmod +x /usr/local/bin/umami-digest.sh`.
+
+   The `.value // .pageviews` pattern in the `jq` filters handles both response shapes Umami has returned across recent versions (some return raw numbers, some return `{value, change}` objects). It picks whichever exists.
+
+3. **Schedule it.**
+
+   For a host-level cron, drop a file in `/etc/cron.d/`:
+
+   ```bash
+   # /etc/cron.d/umami-digest
+   # Every Monday at 08:00 local time.
+   0 8 * * 1   root   /usr/local/bin/umami-digest.sh >> /var/log/umami-digest.log 2>&1
+   ```
+
+   The cron environment needs the variables listed in the script's header. The cleanest pattern is a sourced env file:
+
+   ```bash
+   # /etc/cron.d/umami-digest (revised)
+   SHELL=/bin/bash
+   0 8 * * 1   root   . /etc/umami-digest.env && /usr/local/bin/umami-digest.sh >> /var/log/umami-digest.log 2>&1
+   ```
+
+   With `/etc/umami-digest.env` containing the variables, owned by root, mode 600.
+
+   If you'd rather run the cron inside Docker, drop a sidecar container running [supercronic](https://github.com/aptible/supercronic) on the `posthorn-internal` network with the script and env baked in. That's tidier for fully Dockerized hosts.
+
+4. **Test it now.**
+
+   Run the script manually before waiting for Monday:
+
+   ```bash
+   . /etc/umami-digest.env && /usr/local/bin/umami-digest.sh
+   ```
+
+   You should see `sent digest for 2026-W22` (or whichever ISO week you're in) on stdout, and the email lands in your inbox within seconds. Watch Posthorn's logs:
+
+   ```bash
+   docker compose logs -f posthorn | grep -E 'submission_|idempot'
+   ```
+
+   First run produces `submission_received` then `submission_sent`. Re-running the script the same week produces `idempotent_replay` instead: same response body, no duplicate email. That's the idempotency key (`Idempotency-Key: 2026-W22`) doing its job.
+
+</Steps>
+
+## Why API mode plus idempotency keys, not honeypot + form
+
+A weekly digest is server-to-server traffic. The defenses for browser-facing form endpoints (honeypot, Origin/Referer fail-closed, CSRF tokens) don't apply: there's no browser, no human, no cross-site context. The defenses that DO apply for server-to-server traffic are exactly what API mode provides:
+
+- **Bearer-token auth.** A leaked `POSTHORN_DIGEST_KEY` can be rotated without touching the cron script's other env vars or the Posthorn config (`api_keys` accepts an array; add the new one, redeploy, remove the old).
+- **Idempotency keys.** Cron jobs re-run on failure, on retry-from-systemd, or by accident when you debug them. The ISO-week key makes "send the digest twice in one week" structurally impossible.
+- **Per-key rate limit.** If you ever wire up multiple cron jobs (daily + weekly + monthly digests, alerts on traffic spikes), each gets its own API key and its own rate-limit bucket. One misbehaving cron doesn't starve the others.
+
+This is the kind of endpoint API mode was built for. See the [API mode feature page](/features/api-mode/) for the full set of constraints.
+
+## Variations
+
+- **Add `to_override` for ad-hoc recipients.** If you want to forward a digest to a teammate without changing the endpoint's static `to` list, include `"to_override": "teammate@example.com"` in the POST body. Endpoint-configured `to` becomes the default; the override replaces it for that one request. See [API mode](/features/api-mode/#per-request-recipients-to_override) for the security rationale (per-request `from` is intentionally not allowed; per-request `to` is).
+- **Multiple sites.** If you track multiple websites in one Umami instance, loop the script over an array of `(website_id, label)` pairs and POST one digest per site. Use `Idempotency-Key: $ISO_WEEK-$WEBSITE_ID` so each site's digest gets its own dedupe slot.
+- **Daily instead of weekly.** Change the cron to `0 8 * * *` and use `+%Y-%m-%d` instead of `+%G-W%V` for the idempotency key. Inverse: `0 8 1 * *` for monthly.
+
+## Gotchas
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `curl: (22) … 401 Unauthorized` from Umami login | Username/password wrong, or Umami `APP_SECRET` isn't set in Umami's env | Confirm credentials work via Umami's web UI; check Umami's logs for auth failures |
+| `curl: (22) … 401 Unauthorized` from Posthorn | API key mismatch, or `Authorization:` header malformed | Confirm `POSTHORN_API_KEY` matches one of the `api_keys` in `posthorn.toml`; header should be `Authorization: Bearer <key>` |
+| Email arrives every run despite Idempotency-Key | Idempotency-Key value differs between runs (e.g., time-of-day suffix) | Use a stable key per dedupe window. ISO week (`%G-W%V`) is stable for the whole week |
+| `jq` returns `null` for stats fields | Umami version shifted the response shape | Inspect the raw response: `curl ... /stats | jq .`. Update the `jq` extraction to match. The recipe's `.value // .field` pattern handles the two shapes seen in v2 and v3 |
+| Idempotent replays count against Posthorn's rate limit | They don't | API-mode rate limiting is per-key; idempotent replays return cached responses without incrementing the bucket |
+| Email lands in spam | DNS misconfiguration on sending domain | See [DNS (SPF, DKIM, DMARC)](/security/dns/) |
+
+<Aside type="tip" title="What about Umami Cloud?">
+This recipe is for self-hosted Umami where there's no built-in mailer. Umami Cloud has its own email reports feature; if you're paying for that, you don't need this. The recipe targets the gap that issue [#920](https://github.com/umami-software/umami/issues/920) flagged: self-hosted users who want a periodic email summary without writing it themselves.
+</Aside>
+
+## See also
+
+- [API mode](/features/api-mode/) for the full feature reference (Bearer auth, idempotency keys, per-key rate limiting, `to_override`)
+- [Monitoring alerts via webhook](/recipes/monitoring-alerts/) for the same API-mode pattern applied to uptime/availability alerts
+- [Self-hosted Gitea via Posthorn](/recipes/gitea/) for the SMTP-relay pattern when the source app emits SMTP directly
+- [Transactional email from a Cloudflare Worker](/recipes/cloudflare-worker/) for API mode invoked from a serverless edge runtime

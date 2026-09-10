@@ -1,0 +1,522 @@
+---
+title: Log format
+description: The structured fields in every Posthorn log line.
+---
+
+Posthorn writes structured JSON logs to stdout. Every line is a single JSON object with a consistent set of fields. This page documents the schema so you can build queries, alerts, and dashboards on top of it.
+
+## Standard fields
+
+These appear on every log line:
+
+| Field | Type | Description |
+|---|---|---|
+| `time` | string (RFC 3339, UTC, ms precision) | When the log was written |
+| `level` | string | `INFO`, `WARN`, `ERROR` (Posthorn does not currently emit `DEBUG`) |
+| `msg` | string | Event name (see catalog below) |
+
+## Request-scoped fields (HTTP)
+
+These appear on every log line emitted while processing a specific HTTP request:
+
+| Field | Type | Description |
+|---|---|---|
+| `submission_id` | string (UUIDv4) | Generated at request receipt; threads through every log line for the request |
+| `endpoint` | string | Endpoint path from config (`"/api/contact"`) |
+| `transport` | string | Transport type from config (`"postmark"`) |
+
+These appear on **terminal** events (the final line for a request, success or failure):
+
+| Field | Type | Description |
+|---|---|---|
+| `latency_ms` | int | Total request duration |
+
+## Session-scoped fields (SMTP)
+
+These appear on every log line emitted by a single SMTP session (when the SMTP ingress is configured):
+
+| Field | Type | Description |
+|---|---|---|
+| `session_id` | string (UUIDv4) | Generated when the TCP connection is accepted; threads through every session log line |
+
+## HTTP event catalog
+
+### `submission_received`
+
+```json
+{
+  "time": "2026-05-16T20:01:23.000Z",
+  "level": "INFO",
+  "msg": "submission_received",
+  "submission_id": "7f2c84d6-9b1e-4c2f-a3b8-1a2b3c4d5e6f",
+  "endpoint": "/api/contact",
+  "transport": "postmark"
+}
+```
+
+Emitted after all defenses pass (mode checks, idempotency lookup, origin, rate limit, body parse, honeypot, CSRF, validation) and the submission is about to be rendered + sent. The terminal event (`submission_sent`, `submission_failed`, or `submission_dry_run`) carries `latency_ms`.
+
+### `auth_failed`
+
+API-mode only. The `Authorization: Bearer <key>` was missing or didn't match any configured key.
+
+```json
+{
+  "level": "INFO",
+  "msg": "auth_failed",
+  "submission_id": "...",
+  "endpoint": "/api/transactional",
+  "transport": "postmark",
+  "latency_ms": 0
+}
+```
+
+Key material is **never** logged.
+
+### `auth_rate_limited`
+
+API-mode only. Per-IP brute-force defense: 10 failed-auth attempts from this client IP within ~1 minute, so subsequent failures return 429 instead of 401. The bucket refills over the same window, so a slow legitimate caller who occasionally typos a key isn't affected; a brute-force scanner hits it immediately.
+
+```json
+{
+  "level": "INFO",
+  "msg": "auth_rate_limited",
+  "submission_id": "...",
+  "endpoint": "/api/transactional",
+  "transport": "postmark",
+  "client_ip": "203.0.113.42",
+  "latency_ms": 0
+}
+```
+
+`client_ip` is included for forensic follow-up. Omitted when `strip_client_ip = true` is set on the endpoint.
+
+### `idempotent_replay`
+
+API-mode only. An `Idempotency-Key` matched a cached prior request; the original response was replayed.
+
+```json
+{
+  "level": "INFO",
+  "msg": "idempotent_replay",
+  "submission_id": "...",
+  "endpoint": "/api/transactional",
+  "transport": "postmark",
+  "idempotency_key": "reset:user-123:2026-05-16T20",
+  "replayed_status": 200,
+  "latency_ms": 1
+}
+```
+
+### `idempotent_conflict`
+
+API-mode only. A request arrived with an `Idempotency-Key` that's still in flight (an earlier request with the same key hasn't returned from the upstream yet). Returned as **409**.
+
+```json
+{
+  "level": "INFO",
+  "msg": "idempotent_conflict",
+  "submission_id": "...",
+  "endpoint": "/api/transactional",
+  "transport": "postmark",
+  "idempotency_key": "...",
+  "latency_ms": 0
+}
+```
+
+### `spam_blocked`
+
+```json
+{
+  "level": "INFO",
+  "msg": "spam_blocked",
+  "submission_id": "...",
+  "endpoint": "/api/contact",
+  "transport": "postmark",
+  "kind": "honeypot",
+  "client_ip": "203.0.113.7",
+  "latency_ms": 1
+}
+```
+
+`client_ip` is present unless the endpoint sets `strip_client_ip = true`.
+
+`kind` is one of:
+
+| `kind` | Trigger | Response | Extra fields |
+|---|---|---|---|
+| `honeypot` | Honeypot field non-empty | silent 200 | `client_ip` |
+| `origin` | Origin/Referer failed the `allowed_origins` check | 403 | `reason`, `client_ip` |
+| `csrf` | CSRF token missing/invalid/expired (also logged as `csrf_rejected`) | 403 | `reason`, `client_ip` |
+| `reputation` | Submitter email/IP over the StopForumSpam confidence threshold | 403 | `reason`, `client_ip` |
+| `proof_of_browser` | Missing/invalid/expired/too-new challenge token (also logged as `pob_rejected`) | 403 | `reason`, `client_ip` |
+| `captcha` | Turnstile rejected the token, or a provider error under fail-closed | silent 200 | `client_ip` |
+
+The `body_too_large` case is its own event (below), not a `spam_blocked.kind`.
+
+### `pob_rejected` / `reputation_failed_open` / `captcha_failed_open`
+
+`pob_rejected` accompanies a proof-of-browser block (it also increments `posthorn_spam_blocked_total{kind="proof_of_browser"}`). `reputation_failed_open` and `captcha_failed_open` are logged when a reputation or captcha provider errors and the check is configured to fail open — the submission is *allowed*, and the event pairs with `posthorn_check_failed_open_total{check="reputation"|"captcha"}` so a sustained-outage bypass window is visible.
+
+### `body_too_large`
+
+The request body exceeded `max_body_size` (or the api-mode body-cap default). Returned as **413**.
+
+```json
+{
+  "level": "INFO",
+  "msg": "body_too_large",
+  "submission_id": "...",
+  "endpoint": "/api/contact",
+  "transport": "postmark",
+  "limit_bytes": 1048576,
+  "latency_ms": 2
+}
+```
+
+### `rate_limited`
+
+Rate-limit token bucket empty for this client (form mode = client IP, API mode = matched API key). Returned as **429**.
+
+```json
+{
+  "level": "INFO",
+  "msg": "rate_limited",
+  "submission_id": "...",
+  "endpoint": "/api/contact",
+  "transport": "postmark",
+  "client_ip": "203.0.113.42",
+  "latency_ms": 1
+}
+```
+
+`client_ip` is present on form-mode rate-limit events; **omitted** when `strip_client_ip = true` is set on the endpoint, or on api-mode events (api keys are never logged).
+
+### `csrf_rejected`
+
+Form-mode only, when `csrf_secret` is configured. The `_csrf_token` form field was missing, expired, or had an invalid signature. Returned as **403**.
+
+```json
+{
+  "level": "INFO",
+  "msg": "csrf_rejected",
+  "submission_id": "...",
+  "endpoint": "/api/contact",
+  "transport": "postmark",
+  "kind": "csrf",
+  "reason": "csrf: token expired",
+  "client_ip": "203.0.113.7",
+  "latency_ms": 1
+}
+```
+
+`client_ip` is present unless the endpoint sets `strip_client_ip = true`. CSRF rejections also increment the `posthorn_spam_blocked_total` counter on `/metrics` with `kind="csrf"`.
+
+### `validation_failed`
+
+Required field missing or email malformed. Returned as **422**.
+
+```json
+{
+  "level": "INFO",
+  "msg": "validation_failed",
+  "submission_id": "...",
+  "endpoint": "/api/contact",
+  "transport": "postmark",
+  "fields": ["name", "email"],
+  "latency_ms": 2
+}
+```
+
+### `template_render_failed`
+
+Subject or body template failed to render against the submitted form. Returned as **500**.
+
+```json
+{
+  "level": "ERROR",
+  "msg": "template_render_failed",
+  "submission_id": "...",
+  "endpoint": "/api/contact",
+  "transport": "postmark",
+  "error": "template: subject:1:8: executing \"subject\" at <.missing_field>: ..."
+}
+```
+
+### `submission_dry_run`
+
+Dry-run endpoint (`dry_run = true`) short-circuited before transport. Returned as **200** with the prepared message in the response body.
+
+```json
+{
+  "level": "INFO",
+  "msg": "submission_dry_run",
+  "submission_id": "...",
+  "endpoint": "/api/contact",
+  "transport": "postmark",
+  "latency_ms": 3
+}
+```
+
+### `send_retry_scheduled`
+
+Transport returned a retryable error (transient/5xx or 429). Posthorn is about to wait `delay` and try again.
+
+```json
+{
+  "level": "INFO",
+  "msg": "send_retry_scheduled",
+  "submission_id": "...",
+  "endpoint": "/api/contact",
+  "transport": "postmark",
+  "class": "transient",
+  "status": 503,
+  "delay": 1000000000
+}
+```
+
+`class` is one of:
+
+| Value | Meaning | Delay |
+|---|---|---|
+| `transient` | 5xx or network error | 1s |
+| `rate_limited` | Transport returned 429 | 5s |
+
+`delay` is nanoseconds (slog's `Duration` default encoding).
+
+### `send_retry_succeeded`
+
+The retry returned success.
+
+```json
+{
+  "level": "INFO",
+  "msg": "send_retry_succeeded",
+  "submission_id": "...",
+  "endpoint": "/api/contact",
+  "transport": "postmark"
+}
+```
+
+The subsequent `submission_sent` carries `latency_ms` and `transport_message_id`.
+
+### `send_retry_failed`
+
+The retry also failed. Terminal — the subsequent line is `submission_failed`.
+
+```json
+{
+  "level": "INFO",
+  "msg": "send_retry_failed",
+  "submission_id": "...",
+  "endpoint": "/api/contact",
+  "transport": "postmark",
+  "error": "postmark: 422 The 'From' address is not a valid Sender Signature."
+}
+```
+
+### `submission_sent`
+
+The transport accepted the message. Returned as **200**.
+
+```json
+{
+  "level": "INFO",
+  "msg": "submission_sent",
+  "submission_id": "...",
+  "endpoint": "/api/contact",
+  "transport": "postmark",
+  "latency_ms": 312,
+  "transport_message_id": "abc123-postmark-id"
+}
+```
+
+`transport_message_id` is the upstream's identifier (Postmark's `MessageID`, Resend's `id`, SES's SES Message ID, etc.). Useful for pivoting from Posthorn logs to the provider's UI. Always omitted on outbound-SMTP sends — stdlib `net/smtp` doesn't surface the relay's `queued as <id>` response, so there's no ID to log. Correlate by timestamp + recipient against the relay's own logs in that case.
+
+### `submission_failed`
+
+The transport rejected the message terminally (4xx other than 429, or 5xx after retry exhausted, or 10s timeout). Returned as **502**.
+
+```json
+{
+  "level": "ERROR",
+  "msg": "submission_failed",
+  "submission_id": "...",
+  "endpoint": "/api/contact",
+  "transport": "postmark",
+  "error": "postmark: 422 The 'From' address is not a valid Sender Signature.",
+  "form": {
+    "name": "Alice Smith",
+    "email": "alice@example.com",
+    "message": "..."
+  },
+  "latency_ms": 287
+}
+```
+
+When `log_failed_submissions = false`, `form` is replaced by `form_fields` (key names only, no values):
+
+```json
+{
+  "...": "...",
+  "form_fields": ["name", "email", "message"]
+}
+```
+
+The honeypot field, if present in the submitted form, is redacted to `"<redacted>"` in the `form` map so spam payloads don't immortalize in operator logs.
+
+## SMTP event catalog
+
+Emitted when `[smtp_listener]` is configured. Every event carries `session_id` and standard fields.
+
+### `smtp_session_open`
+
+TCP connection accepted.
+
+```json
+{
+  "level": "INFO",
+  "msg": "smtp_session_open",
+  "session_id": "...",
+  "tls": "no"
+}
+```
+
+### `smtp_tls_established` / `smtp_tls_handshake_failed`
+
+After `STARTTLS`. The `failed` variant carries `error`.
+
+### `smtp_auth_ok` / `smtp_auth_failed`
+
+AUTH PLAIN result. Carries `user` (the username, never the password).
+
+### `smtp_sender_rejected`
+
+`MAIL FROM:` not in `allowed_senders`. Carries `from`.
+
+### `smtp_recipient_rejected`
+
+`RCPT TO:` exceeded session cap or hit the `allowed_recipients` block. Carries `to`.
+
+### `smtp_submission_sent`
+
+Outbound transport accepted the message. Carries `transport_message_id` if the upstream returned one.
+
+### `smtp_submission_failed`
+
+Outbound transport rejected the message. ERROR level.
+
+### `smtp_session_close`
+
+The session ended. Carries `reason` (`"quit"` for clean QUIT; other values reflect connection-level termination).
+
+## Process-lifecycle events
+
+### `posthorn starting`
+
+Emitted once at process start.
+
+```json
+{
+  "level": "INFO",
+  "msg": "posthorn starting",
+  "version": "v1.0.0",
+  "listen": ":8080",
+  "config": "/etc/posthorn/config.toml",
+  "endpoints": 2
+}
+```
+
+### `endpoint registered`
+
+Emitted per endpoint at startup.
+
+```json
+{
+  "level": "INFO",
+  "msg": "endpoint registered",
+  "path": "/api/contact",
+  "transport": "postmark",
+  "recipients": 1
+}
+```
+
+### `smtp_listener registered`
+
+Emitted at startup if `[smtp_listener]` is in config.
+
+```json
+{
+  "level": "INFO",
+  "msg": "smtp_listener registered",
+  "listen": ":2525",
+  "transport": "postmark",
+  "smtp_users": 1
+}
+```
+
+### `http ingress listening` / `smtp ingress listening`
+
+Each ingress prints a one-time line when its accept loop starts.
+
+### `shutdown signal received`
+
+SIGTERM or SIGINT received. Posthorn begins draining in-flight requests with a 15-second deadline.
+
+```json
+{
+  "level": "INFO",
+  "msg": "shutdown signal received",
+  "signal": "terminated"
+}
+```
+
+### `second signal received, forcing exit`
+
+WARN level. A second SIGTERM/SIGINT arrived during drain; the process exits immediately.
+
+### `posthorn stopped`
+
+Emitted once after all ingresses have stopped (or the shutdown deadline expired).
+
+## Useful queries (Loki)
+
+```text
+# All errors in the last hour
+{service="posthorn"} | json | level="ERROR"
+
+# Failed submissions on a specific endpoint
+{service="posthorn"} | json | msg="submission_failed" | endpoint="/api/contact"
+
+# Rate of submissions by endpoint over time
+sum by (endpoint) (
+  rate({service="posthorn"} | json | msg="submission_sent" [5m])
+)
+
+# Top spam sources
+topk(10,
+  sum by (client_ip) (
+    count_over_time({service="posthorn"} | json | msg="spam_blocked" [1h])
+  )
+)
+```
+
+## Useful queries (jq for ad-hoc analysis)
+
+```bash
+# Tail and pretty-print
+docker logs -f posthorn | jq .
+
+# All failures from the last hour
+docker logs --since 1h posthorn | jq 'select(.level=="ERROR")'
+
+# Latency P99 over the last 1000 sent submissions
+docker logs --tail 10000 posthorn \
+  | jq -s 'map(select(.msg=="submission_sent")) | sort_by(.latency_ms) | .[-10:]'
+
+# Find a specific submission across all log lines
+docker logs posthorn | jq 'select(.submission_id=="7f2c84d6-9b1e-4c2f-a3b8-1a2b3c4d5e6f")'
+
+# Find a specific SMTP session across all log lines
+docker logs posthorn | jq 'select(.session_id=="...")'
+```

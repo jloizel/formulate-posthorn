@@ -1,0 +1,152 @@
+---
+title: Roadmap
+description: What's shipped, what's next, and how to influence the order.
+---
+
+import { LinkCard, Aside } from '@astrojs/starlight/components';
+
+This page is the **canonical public roadmap**. The narrative lives here; the execution surface (open issues, in-flight work) lives in [GitHub Milestones](https://github.com/craigmccaskill/posthorn/milestones).
+
+Posthorn ships in deliberately small, scoped releases. v1.0 absorbs what was originally sequenced as v1.1, v1.2, and v1.3 into a single release because the surface area is small enough that splitting them produced more carve-outs than coherent product moments. v2 is the next planned milestone — the stateful-platform shift.
+
+## v1.0 — first public release
+
+**Status:** released. See the [GitHub Releases page](https://github.com/craigmccaskill/posthorn/releases) for the version history.
+
+**Scope:** three ingress shapes, five outbound transports, full spam-protection stack, idempotency, dry-run, Prometheus metrics, hand-rolled SMTP listener for internal apps.
+
+| Ingress | Detail |
+|---|---|
+| HTTP form (default) | `application/x-www-form-urlencoded`, `multipart/form-data`; honeypot, Origin/Referer fail-closed, optional CSRF tokens, rate limit |
+| HTTP API mode | Bearer auth, JSON body, idempotency keys, per-request `to_override`, per-key rate limit |
+| SMTP listener | AUTH PLAIN / client-cert, STARTTLS-required, sender allowlist + recipient allowlist or cap, size cap |
+
+| Transport | Detail |
+|---|---|
+| Postmark | HTTP API, server-token auth |
+| Resend | HTTP API, bearer auth |
+| Mailgun | HTTP API, basic auth, multipart body, US/EU regions |
+| AWS SES | HTTP API, Signature Version 4 (SigV4) auth, region-scoped |
+| Outbound SMTP | Any STARTTLS-capable relay; stdlib `net/smtp` |
+
+Operational essentials: `/healthz`, `/metrics` (Prometheus exposition), dry-run mode, IP-stripping, named `trusted_proxies` presets (Cloudflare).
+
+What you can do today:
+
+- Drop in a self-hosted contact form on any host that blocks outbound SMTP
+- Run Posthorn as a Docker sidecar next to your blog / static site / app stack
+- Hit it from a Cloudflare Worker for transactional sends with safe retries
+- Point Ghost / Gitea / Mastodon / Authentik at Posthorn's SMTP listener and let them keep speaking SMTP
+- Reverse-proxy from whatever front door you already use (Caddy, nginx, Traefik, Cloudflare)
+
+[Get started →](/getting-started/quick-start/)
+
+## Spam protection
+
+[Track on GitHub →](https://github.com/craigmccaskill/posthorn/milestone/1)
+
+A focused release that stacks additive defenses on top of the v1.0 form-mode protections (honeypot, Origin/Referer fail-closed, rate limit, CSRF). Each item is independently shippable and backwards-compatible — existing configs keep working unchanged. No platform-shape changes, no storage layer required. (Milestone names describe themes, not version numbers; this lands in a future minor release.)
+
+The order below reflects a concrete, validated workload: live contact-form spam against a production deployment with honeypot + Origin + rate-limit all correctly configured still lands, because form-blaster bots (Xrumer / GSA SER) render the page for a valid `Referer`, skip the empty honeypot, and trickle under the burst cap. The items that actually beat that pattern lead the release; the ones that the observed spam would have walked straight past are deprioritized.
+
+**Leads the release — beats the observed pattern.** The order was re-cut on 2026-07-04 against real spam captured on a production deployment: distributed reply-bait from burner Gmail addresses, in four different languages, zero-to-one links, one line to a wall of text. There is no content signature, so the checks that win are the content-agnostic ones that key on identity and bot behavior. **The three checks below are merged to `main` and ship in the next minor release.**
+
+- ✅ **Reputation-based spam check** (merged) — optional StopForumSpam lookup on the submitter email and IP before send; fail-open so an outage never blocks legitimate mail. It catches the sender, not the message, so it works across every language and length the spam takes, and the repeat offender (the same burner address hitting a form for days) is caught on every attempt after the first. ([#44](https://github.com/craigmccaskill/posthorn/issues/44))
+- ✅ **Proof-of-browser token** (merged) — a JS-gated submit token that blocks form-blasters which POST directly without executing JavaScript. Also content-agnostic, no third-party dependency, no UX friction; the cheap kill for the bots reputation hasn't catalogued yet. ([#45](https://github.com/craigmccaskill/posthorn/issues/45))
+- ✅ **Cloudflare Turnstile verification** (merged) — optional per-endpoint captcha for high-spam targets; the durable backstop that stops even headless-browser bots. siteverify call on submit, byte-identical 200 response on failure. ([#33](https://github.com/craigmccaskill/posthorn/issues/33))
+- **CSRF minimum-age check** — extends the existing CSRF TTL with a floor; bots that POST within milliseconds of token issuance get rejected. ([#32](https://github.com/craigmccaskill/posthorn/issues/32))
+
+**Ships alongside the checks — operator trust and robustness (added 2026-07-03):**
+
+- **Blocked-spam visibility** — per-endpoint `on_spam = "discard" | "log"`, plus `action = "tag"` on the fuzzy checks (reputation) to deliver with a `[SPAM?]` subject prefix instead of rejecting. A confidence-threshold check can false-positive, and without visibility that erodes trust invisibly: operators need to audit what got blocked. A batched email digest of blocked submissions is deferred to a follow-up release with its own design pass. ([#61](https://github.com/craigmccaskill/posthorn/issues/61))
+- **Single-use tokens** — CSRF and proof-of-browser tokens die after first successful use (bounded in-memory cache of consumed tokens). Without this, one harvested token replays for the full TTL window; with it, the minimum-age and proof-of-browser checks hold against harvest-and-replay. ([#62](https://github.com/craigmccaskill/posthorn/issues/62))
+- **`origin_policy = "strict"`** — opt-in: a present-but-mismatched `Origin` header rejects immediately, with no Referer fallback. Default stays lenient for compatibility with privacy extensions. ([#63](https://github.com/craigmccaskill/posthorn/issues/63))
+
+**Deprioritized — ships when a real deployment surfaces the matching pattern:**
+
+- **Content-shape validation** — `max_links` URL cap and `min_message_length`. Deprioritized after the real spam turned out to have no content signature: link counts of zero to one, lengths from one line to a wall of text, so a URL cap catches nothing and a length floor would reject legitimate short inquiries. Kept as a bounded primitive if a link-heavy pattern ever surfaces. ([#34](https://github.com/craigmccaskill/posthorn/issues/34))
+- **Multiple honeypot fields** — `honeypot` accepts an array; any field being filled trips rejection. Marginal against bots that skip hidden fields entirely. ([#31](https://github.com/craigmccaskill/posthorn/issues/31))
+- **Operator-provided email-domain blocklist** — disposable-provider domains from a file. Deprioritized: the observed spam came from mainstream providers (gmail), so a disposable-domain list scored zero against it. ([#35](https://github.com/craigmccaskill/posthorn/issues/35))
+- **Per-day rate-limit cap** — stacks on the existing token bucket for long-running low-rate abuse. Deprioritized: the observed spam is a distributed trickle from varied IPs, which a per-identity daily cap doesn't touch. ([#36](https://github.com/craigmccaskill/posthorn/issues/36))
+
+Ordering reflects validated workload over upvotes — an item that a real deployment proves it needs (or proves it doesn't) moves accordingly.
+
+## v2.0 — gateway reliability
+
+[Track on GitHub →](https://github.com/craigmccaskill/posthorn/milestone/3)
+
+The stateful shift, recut on 2026-08-02 against the project's first principles: Posthorn is the integration seam between your apps and the provider you already trust, and everything in v2.0 has to strengthen that seam. Two originally-planned items (unsubscribe injection, multiple outputs per endpoint) moved out behind demand gates — see the out-of-scope table below.
+
+**Storage spine** (optional — without a `[storage]` block, v2.0 behaves exactly like v1.x):
+
+- **SQLite submission log** — every submission persisted, queryable with the stock `sqlite3` CLI
+- **Sync-first retry queue** — 200 still means *sent*. A new 202 "queued" state appears only where v1.x gave up and dropped mail after exhausting inline retries; those sends now survive restarts and retry with backoff
+- **Durable idempotency** — the v1.0 in-memory cache becomes restart-survivable
+- **Bounded and self-monitoring** — retention pruning, a hard size cap so Posthorn can never fill your disk, and a storage canary surfaced in `/healthz` and `/metrics`. Storage failure never blocks mail: the gateway degrades to v1.x synchronous behavior and tells you loudly
+
+**Seam features:**
+
+- **HTML body support** — `body_format = "html"` per endpoint, submitter input auto-escaped by construction, plain-text part auto-derived (or supplied via `text_body`)
+- **Lifecycle event callbacks** — delivery / bounce / spam-complaint events forwarded to the originating caller with an HMAC-signed webhook. Postmark first, behind a provider-agnostic event shape. Requires Posthorn to be reachable by the provider's webhooks — deliberately-internal deployments keep everything else
+- **Suppression list (minimal slice)** — auto on hard bounces and spam complaints, protecting your provider account; suppressed sends answer `200 {"status": "suppressed"}` so callers treat it as final. Managed via `posthorn suppressions` CLI; no admin HTTP API
+- **Webhook transport** — deliver a submission as a signed JSON POST instead of an email; same retry classification as every mail transport
+- **File attachments** — opt-in per endpoint, explicit content-type allowlist enforced against the actual bytes, form + API-mode ingress
+
+A data-at-rest documentation page ships with the release: what the SQLite file contains, retention, sizing, and the backup/permissions posture it deserves.
+
+**Under design discussion, not yet committed:** multi-tenant SMTP routing — sender-driven transport selection so one listener serves multiple tenants. See [issue #30](https://github.com/craigmccaskill/posthorn/issues/30).
+
+The `Transport.Send` interface stays the synchronous primitive; the queue wraps it. v1.x deployments keep working unchanged.
+
+## Smaller items on the queue
+
+Operator feedback from the v1.0 launch surfaced a few quality-of-life items that don't justify a v2 wait. These ship as patch releases or a 1.1 feature bump:
+
+- **Auto-generate ephemeral self-signed TLS certs** when `require_tls = true` and no `tls_cert`/`tls_key` is provided. For internal-network deployments where TLS-on-the-wire is wanted but certificate file management isn't. Requires explicit startup logging that the cert is ephemeral and not trustworthy for external clients. [Issue #27](https://github.com/craigmccaskill/posthorn/issues/27).
+- **Friendlier validation errors with deployment-pattern hints.** Errors that surface common-config-shape examples ("for internal Docker networks, use auth_required = none; for production, use smtp-auth with require_tls = true"). Polish, but the validation surface is where new operators first encounter Posthorn's mental model. [Issue #28](https://github.com/craigmccaskill/posthorn/issues/28).
+
+## v3 — speculative
+
+No date. Depends entirely on community traction:
+
+- **Admin UI** — embedded web app for browsing submissions, viewing logs, retrying failed sends (requires v2's SQLite storage)
+- **Proof-of-work spam challenge** — computational cost imposed on submitters; defeats botnet spam from many low-rate IPs that the v1.0 rate limiter can't catch
+- **PGP encryption** — encrypt outbound mail to recipient public keys at the gateway
+
+## How to influence the order
+
+<Aside type="tip">
+The v2 ordering isn't set in stone. Adoption signals reshuffle priorities — if every early user asks for the same thing, that thing moves up.
+</Aside>
+
+If you want to push something forward:
+
+1. **Open a [feature request](https://github.com/craigmccaskill/posthorn/issues/new?template=feature.yml)** with a concrete use case. Pitches like "wouldn't it be cool if..." get less weight than "I want to use Posthorn for X, but Y is missing."
+2. **Comment on the relevant milestone or existing issue** with your use case. Adoption signal beats pure upvotes.
+3. **Start a [discussion](https://github.com/craigmccaskill/posthorn/discussions)** for half-formed ideas where the right framing isn't clear yet.
+
+## What's deliberately out of scope
+
+These come up in conversation and are worth naming explicitly:
+
+| Feature | Why not |
+|---|---|
+| Acting as a "real" MTA (MX records, inbound mail) | Posthorn is an authenticated relay, not a mail server. The SMTP listener accepts mail from known internal clients only — see [SMTP ingress](/features/smtp-ingress/). |
+| Markdown body rendering | Templates are plain text. v2 may add markdown with explicit escaping. |
+| GUI installer / first-run wizard | The TOML config is the source of truth; no UI in front of it. |
+| Replacing transactional providers entirely (running our own outbound SMTP fleet) | That's "build a postfix replacement" territory; out of scope forever. The point of Posthorn is to *use* your provider, not become one. |
+| Batch send API | Deferred without a target version. The api-mode audience surveyed didn't have a real workload for it; we'll reconsider when an operator surfaces with concrete batch volume that round-trip overhead actually constrains. |
+| Automatic unsubscribe link injection | Moved out of v2.0 (2026-08-02): it primarily serves bulk-ish sending, which is the marketing lane, and drags a hosted public endpoint with it. Ships when a real bulk-ish send is actually imminent — and even then as compliance plumbing only (RFC 8058 one-click), never campaign features. [Issue #9](https://github.com/craigmccaskill/posthorn/issues/9). |
+| Multiple outputs per endpoint (fan-out) | Moved out of v2.0 (2026-08-02): no named operator need yet. Re-enters when someone surfaces with a concrete fan-out workload. [Issue #25](https://github.com/craigmccaskill/posthorn/issues/25). |
+
+<LinkCard
+  title="Track current work on GitHub"
+  description="Live milestone view with the open issues, in-flight PRs, and what's already done."
+  href="https://github.com/craigmccaskill/posthorn/milestones"
+/>
+
+<LinkCard
+  title="Read the v1.0 spec"
+  description="The full project brief, PRD, and architecture document — what's settled and why."
+  href="https://github.com/craigmccaskill/posthorn/tree/main/spec"
+/>

@@ -1,0 +1,78 @@
+---
+title: Transports
+description: Per-endpoint transport configuration. Posthorn ships five — Postmark, Resend, Mailgun, AWS SES, and outbound SMTP.
+---
+
+import { Aside, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+A **transport** is the egress side — the thing that turns a parsed submission into a delivered email. Posthorn ships five transports out of the box; each endpoint picks exactly one.
+
+```toml
+[endpoints.transport]
+type = "postmark"  # or "resend", "mailgun", "ses", "smtp"
+
+[endpoints.transport.settings]
+# Per-transport settings, see the matching page below.
+```
+
+Different endpoints in one Posthorn instance can use different transports, or different settings (different API keys) on the same transport.
+
+## Choosing a transport
+
+| Transport | Best fit | Auth shape | Body format |
+|---|---|---|---|
+| **Postmark** | Transactional email at low-to-medium volume. Strong deliverability defaults. | `X-Postmark-Server-Token` header | JSON |
+| **Resend** | Modern HTTP API; developer-friendly dashboard. Smaller deliverability track record than Postmark. | `Authorization: Bearer` | JSON |
+| **Mailgun** | Higher-volume transactional. EU region available. | HTTP Basic (`api:<key>`) | multipart/form-data |
+| **AWS SES** | AWS-native deployments. Cheapest per-message at volume. Operator owns deliverability. | AWS SigV4 | JSON |
+| **Outbound SMTP** | Operator-controlled relay (self-hosted Postfix, Mailgun's SMTP gateway, Mailtrap for testing). The "I want SMTP" fallback. | SMTP AUTH PLAIN | SMTP DATA |
+| **Webhook** (v2.0) | Non-mail sink: deliver the structured submission as a signed JSON POST to a receiver you run. | HMAC signature (+ your own static headers) | JSON |
+
+### Capability matrix (v2.0)
+
+Sending capabilities are uniform; [lifecycle event](/features/lifecycle/) ingestion is not — it's built per provider dialect, Postmark first.
+
+| Capability | Postmark | Resend | Mailgun | SES | SMTP out | Webhook |
+|---|---|---|---|---|---|---|
+| Text / HTML body | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (both in payload) |
+| Attachments | ✓ | ✓ | ✓ | ✓ | ✓ | — |
+| Retry queue eligible | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Lifecycle events in | ✓ | on demand | on demand | on demand | n/a | n/a |
+
+<CardGrid>
+  <LinkCard title="Postmark" href="/configuration/transports/postmark/" description="X-Postmark-Server-Token, JSON, recommended default." />
+  <LinkCard title="Resend" href="/configuration/transports/resend/" description="Bearer auth, JSON, RFC 5322-style API." />
+  <LinkCard title="Mailgun" href="/configuration/transports/mailgun/" description="HTTP Basic, multipart, US + EU regions." />
+  <LinkCard title="AWS SES" href="/configuration/transports/ses/" description="SigV4, JSON, region-scoped endpoints." />
+  <LinkCard title="Outbound SMTP" href="/configuration/transports/smtp/" description="STARTTLS + AUTH PLAIN against any SMTP relay." />
+  <LinkCard title="Webhook" href="/configuration/transports/webhook/" description="Signed JSON POST to your own receiver. (v2.0)" />
+</CardGrid>
+
+## What every transport guarantees
+
+Every transport in the registry honors these invariants. They're tested per-transport — adding a new one requires passing the same suite.
+
+| Invariant | What it means |
+|---|---|
+| **No header injection** | Submitter-controlled fields (From, To, Subject, Reply-To, recipients) reach the provider through structural API constructs — JSON struct marshaling, multipart writers, or pre-write CRLF (carriage-return / line-feed) validation. CRLF in any field cannot construct a sibling header. |
+| **API keys never logged** | The transport sets credentials at request-construction time and never passes them to the logger. Test suites include sentinel-token assertions that the configured key string does not appear in any captured log output, even on failure paths. |
+| **Consistent error classes** | Every transport classifies failures as `ErrTransient` (network, 5xx, transient SMTP 4xx → retry), `ErrRateLimited` (429 → retry with longer backoff), `ErrTerminal` (auth failures, 4xx other than 429, permanent SMTP 5xx → no retry). The retry policy is ingress-agnostic. |
+| **Message-ID surfacing** | Where the provider returns one, `transport_message_id` lands in the `submission_sent` log line so operators can correlate Posthorn logs with the provider's dashboard. |
+
+## Why bespoke clients, not SDKs
+
+Every transport in Posthorn is a hand-rolled HTTP (or SMTP) client. No `postmark-go`, no `aws-sdk-go-v2`, no `mailgun-go`:
+
+- Each provider's surface area is small (typically one or two endpoints we care about). Bespoke runs ~150–250 lines per transport.
+- SDKs come with transitive dependency trees we don't want to track for security updates. The smallest mainstream email SDK still pulls in 20+ packages.
+- Bespoke gives us complete control over header construction — the structural header-injection defense lives in the transport code, not in some SDK we'd have to audit on every release.
+
+The marginal case is AWS SES, which needs Signature Version 4 (SigV4) signing. We implement that bespoke too (~230 lines), with a documented threshold: if bespoke ever grows past 500 lines of implementation for a single transport, we revisit the SDK question.
+
+## Registering a new transport
+
+Adding a sixth (or sixteenth) transport is a single new file in `core/transport/`. The file calls `Register` in an `init()` that names the type and provides a validator + builder pair. No edits to the gateway handler, the config loader, the rate limiter, or the response writer.
+
+<Aside type="caution">
+The transport registry is an internal extension point. If you're forking Posthorn to add a custom transport, the API may evolve — open an issue first so we can keep your patch compatible.
+</Aside>

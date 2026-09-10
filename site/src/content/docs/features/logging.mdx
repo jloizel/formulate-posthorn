@@ -1,0 +1,169 @@
+---
+title: Structured logging
+description: JSON logs with submission IDs, threaded through every request lifecycle event.
+---
+
+Posthorn emits structured JSON logs for every operationally meaningful event. Each log line carries a UUIDv4 submission ID that threads through the lifecycle of a single submission, so you can grep one ID to see every decision point for that request.
+
+## Format
+
+Default format is JSON. Every log entry is a single line of JSON with these standard fields:
+
+```json
+{
+  "time": "2026-05-14T20:01:23.456Z",
+  "level": "INFO",
+  "msg": "submission_sent",
+  "submission_id": "7f2c84d6-9b1e-4c2f-a3b8-1a2b3c4d5e6f",
+  "endpoint": "/api/contact",
+  "transport": "postmark",
+  "latency_ms": 312
+}
+```
+
+| Field | Always present | Description |
+|---|---|---|
+| `time` | yes | ISO 8601 timestamp, UTC, millisecond precision |
+| `level` | yes | `INFO`, `WARN`, `ERROR` (Posthorn does not currently emit `DEBUG`) |
+| `msg` | yes | Event name (see event catalog below) |
+| `submission_id` | HTTP request-scoped events | UUIDv4 generated at request receipt |
+| `session_id` | SMTP session-scoped events | UUIDv4 generated when the SMTP connection is accepted |
+| `endpoint` | HTTP request-scoped events | Path from config |
+| `transport` | HTTP request-scoped events | `"postmark"`, `"resend"`, etc. |
+| `latency_ms` | terminal events | Total duration in milliseconds |
+
+## Event catalog
+
+Every HTTP request-pipeline event Posthorn emits. See the [log format reference](/reference/log-format/) for full field schemas per event.
+
+| Event | Level | When |
+|---|---|---|
+| `submission_received` | INFO | All defenses passed; request entering the send pipeline |
+| `auth_failed` | INFO | API-mode `Authorization: Bearer` missing or unknown key — **401** |
+| `auth_rate_limited` | INFO | Per-IP failed-auth budget exhausted (brute-force defense) — **429** |
+| `idempotent_replay` | INFO | API-mode `Idempotency-Key` matched a cached prior response — replayed verbatim |
+| `idempotent_conflict` | INFO | API-mode `Idempotency-Key` matches an in-flight request — **409** |
+| `spam_blocked` | INFO | Honeypot fired or Origin/Referer rejected — **403** (origin) or silent **200** (honeypot) |
+| `body_too_large` | INFO | Request body exceeded the cap — **413** |
+| `rate_limited` | INFO | Token bucket empty — **429** |
+| `csrf_rejected` | INFO | Cross-Site Request Forgery (CSRF) token missing, expired, or invalid signature — **403** (form-mode only) |
+| `validation_failed` | INFO | Required field missing or email malformed — **422** |
+| `template_render_failed` | ERROR | Subject or body template errored — **500** |
+| `submission_dry_run` | INFO | Endpoint `dry_run = true` short-circuited — **200** with prepared message |
+| `send_retry_scheduled` | INFO | Transport returned 5xx/transient or 429; waiting `delay` before retry |
+| `send_retry_succeeded` | INFO | The retry returned success |
+| `send_retry_failed` | INFO | The retry also failed; terminal |
+| `submission_sent` | INFO | Transport accepted the message — **200**, includes `transport_message_id` |
+| `submission_failed` | ERROR | Terminal failure (no retry, or retry exhausted) — **502** |
+
+SMTP-ingress events (when `[smtp_listener]` is configured):
+
+| Event | Level | When |
+|---|---|---|
+| `smtp_session_open` | INFO | TCP connection accepted |
+| `smtp_tls_established` | INFO | After successful STARTTLS |
+| `smtp_tls_handshake_failed` | INFO | STARTTLS error |
+| `smtp_auth_ok` / `smtp_auth_failed` | INFO | AUTH PLAIN result (password never logged) |
+| `smtp_sender_rejected` | INFO | `MAIL FROM:` not in `allowed_senders` |
+| `smtp_recipient_rejected` | INFO | `RCPT TO:` exceeded session cap or recipient block |
+| `smtp_submission_sent` | INFO | Outbound transport accepted |
+| `smtp_submission_failed` | ERROR | Outbound transport rejected |
+| `smtp_session_close` | INFO | Session ended (`reason: "quit"` for clean QUIT) |
+
+Process-lifecycle events (one-time, not per-request):
+
+| Event | Level | When |
+|---|---|---|
+| `posthorn starting` | INFO | Process starting; carries `version`, `listen`, `config`, `endpoints` count |
+| `endpoint registered` | INFO | Per-endpoint at startup; carries `path`, `transport`, `recipients` count |
+| `smtp_listener registered` | INFO | When `[smtp_listener]` block is configured |
+| `http ingress listening` / `smtp ingress listening` | INFO | Per-ingress when accept loop starts |
+| `shutdown signal received` | INFO | SIGTERM/SIGINT received; 15s drain begins |
+| `second signal received, forcing exit` | WARN | A second signal during drain; process exits immediately |
+| `posthorn stopped` | INFO | After all ingresses stopped |
+
+## `submission_failed` payload
+
+When `log_failed_submissions = true` (the default), terminal failures log the **full form payload** at ERROR level under the `form` field:
+
+```json
+{
+  "time": "2026-05-16T20:01:23.456Z",
+  "level": "ERROR",
+  "msg": "submission_failed",
+  "submission_id": "7f2c84d6-9b1e-4c2f-a3b8-1a2b3c4d5e6f",
+  "endpoint": "/api/contact",
+  "transport": "postmark",
+  "error": "postmark: 422 The 'From' address is not a valid Sender Signature.",
+  "form": {
+    "name": "Alice Smith",
+    "email": "alice@example.com",
+    "message": "I would like to discuss..."
+  },
+  "latency_ms": 287
+}
+```
+
+The rationale: when a submission has failed terminally, the operator's primary recovery path is reading the form contents out of the logs and replying manually. Without the payload, the data is gone.
+
+The honeypot field's value is redacted to `"<redacted>"` in the `form` map even when present — spam payloads don't immortalize in operator logs.
+
+For GDPR-sensitive contexts where you can't log form contents, flip the switch per endpoint:
+
+```toml
+[[endpoints]]
+path = "/api/contact"
+log_failed_submissions = true   # log full form payloads here
+
+[[endpoints]]
+path = "/api/medical-intake"
+log_failed_submissions = false  # log only field NAMES here
+```
+
+When `log_failed_submissions = false`, the metadata still logs (event, error, latency, IDs) and `form_fields` lists just the key names (no values).
+
+## Levels
+
+| Level | Use |
+|---|---|
+| `INFO` | Standard events: submissions received, sent, blocked, rate-limited, retries |
+| `WARN` | One specific event — a second SIGTERM/SIGINT during graceful shutdown |
+| `ERROR` | `template_render_failed`, `submission_failed`, `smtp_submission_failed` |
+
+Posthorn does not currently emit `DEBUG`. Configure the global minimum:
+
+```toml
+[logging]
+level = "info"
+```
+
+## Format
+
+```toml
+[logging]
+format = "json"
+```
+
+`"json"` is the only supported value (the config loader rejects anything else). Posthorn writes to stdout; structure-parsing pipelines (Loki, Elasticsearch, Datadog, CloudWatch, journald with a JSON parser) ingest the lines directly.
+
+## What never appears in logs
+
+By design:
+
+- **API keys.** Configured transport API keys, api-mode `api_keys`, `csrf_secret`, and SMTP `smtp_users` passwords — never logged in any code path. Tests verify by triggering failures with sentinel-key strings and asserting the string does not appear in captured log output.
+- **Honeypot field values.** Redacted to `"<redacted>"` if present in a `submission_failed` form payload.
+- **Submitter content in `/metrics` labels.** The Prometheus exposition keeps cardinality bounded — labels carry only operator-configured names (endpoint paths, transport types, error class enum), never submitter content.
+
+See [API keys](/security/api-keys/) for the full guarantee.
+
+## Correlating across services
+
+The `submission_id` is returned to the client in the 200 JSON response:
+
+```json
+{ "status": "ok", "submission_id": "7f2c84d6-9b1e-4c2f-a3b8-1a2b3c4d5e6f" }
+```
+
+If the client wants to surface that ID to the end user (an "Your message has been received, ID: 7f2c84d6..." confirmation), they can. Then a support request that quotes the ID maps directly to log lines in Posthorn.
+
+The `submission_sent` event also carries `transport_message_id` — the upstream provider's identifier (Postmark's `MessageID`, Resend's `id`, SES's Message ID, etc.) — so you can pivot from Posthorn logs straight to the provider's UI for any submission.

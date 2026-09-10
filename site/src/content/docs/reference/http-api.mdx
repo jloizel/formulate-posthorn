@@ -1,0 +1,249 @@
+---
+title: HTTP API
+description: The wire format Posthorn accepts and returns.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Posthorn exposes one HTTP endpoint per configured `[[endpoints]]` block. Endpoints come in two flavors selected by the `auth` config field:
+
+- **Form mode** (`auth = "form"`, the default) — browser form posts; honeypot/Origin/CSRF defenses; redirect responses; documented in this page below.
+- **API mode** (`auth = "api-key"`) — server-to-server JSON; Bearer auth; idempotency keys; per-request `to_override`; documented in the [API mode feature page](/features/api-mode/).
+
+Plus two always-on operational endpoints on the same listener:
+
+- `GET /healthz` — 200 OK / body `ok`
+- `GET /metrics` — Prometheus text exposition
+
+This page documents the form-mode wire format. For api-mode wire format, jump to [API mode](/features/api-mode/).
+
+## Form-mode request
+
+| Aspect | Required value |
+|---|---|
+| Method | `POST` |
+| Path | Any configured form-mode `path` (e.g., `/api/contact`) |
+| Content-Type | `application/x-www-form-urlencoded` or `multipart/form-data` |
+| Body | Form-encoded key/value pairs |
+
+Other methods (`GET`, `HEAD`, `PUT`, `DELETE`, etc.) return `405 Method Not Allowed`. Other content types return `400 Bad Request`. JSON bodies on form-mode endpoints return `400`; JSON bodies on api-mode endpoints are required (anything else returns `415 Unsupported Media Type`).
+
+### Form-encoded example
+
+```http
+POST /api/contact HTTP/1.1
+Host: example.com
+Content-Type: application/x-www-form-urlencoded
+Origin: https://example.com
+
+name=Alice+Smith&email=alice%40example.com&message=Hello+world
+```
+
+### Multipart example
+
+```http
+POST /api/contact HTTP/1.1
+Host: example.com
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
+
+------WebKitFormBoundary
+Content-Disposition: form-data; name="name"
+
+Alice Smith
+------WebKitFormBoundary
+Content-Disposition: form-data; name="email"
+
+alice@example.com
+------WebKitFormBoundary
+Content-Disposition: form-data; name="message"
+
+Hello world
+------WebKitFormBoundary--
+```
+
+Both forms are handled by `r.ParseForm()` and produce the same internal representation.
+
+<Aside type="note">
+**File uploads (multipart with `Content-Type: application/octet-stream` parts) are accepted at the wire level but ignored.** Posthorn does not currently forward attachments to the transport. Attachment support is planned for v2. If your form includes file inputs, the file content is silently dropped — only the text fields make it to the email.
+</Aside>
+
+## Response — success
+
+When the submission is accepted and the transport returned success:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "status": "ok",
+  "submission_id": "7f2c84d6-9b1e-4c2f-a3b8-1a2b3c4d5e6f"
+}
+```
+
+When `redirect_success` is configured and the client prefers `text/html`:
+
+```http
+HTTP/1.1 303 See Other
+Location: /thank-you
+```
+
+## Response — error
+
+Errors return either a **JSON body** (on `422 Unprocessable Entity` only) or a **plaintext body** (every other non-2xx status), or redirect to `redirect_error` if one is configured and the client prefers `text/html`.
+
+### JSON error schema (422 only)
+
+```json
+{
+  "error": "validation failed",
+  "code": "validation_failed",
+  "fields": {
+    "field_name": "field-specific error"
+  }
+}
+```
+
+The structured `fields` map is the contract clients should program against — it enumerates *every* failing field in one response so a form UI can render all errors at once.
+
+### Plaintext error bodies (all other non-2xx)
+
+Other status codes return a one-line plaintext body (`Content-Type: text/plain; charset=utf-8`). The exact strings are documented per-status in [Response codes](/reference/response-codes/). Programmatic callers should branch on **status code**, not body text — the strings are stable but not part of a versioned contract.
+
+Promoting every error to structured JSON is on the future polish list. If you'd find it useful, open a feature request describing the use case.
+
+### Status codes
+
+| Status | Meaning | Mode(s) |
+|---|---|---|
+| `200 OK` | Submission accepted and sent; also silent 200 on honeypot trigger (form mode) or idempotent replay (api mode); also 200 for dry-run | both |
+| `303 See Other` | Redirect after success or error | form (when `redirect_success`/`redirect_error` configured) |
+| `400 Bad Request` | Malformed request — wrong content type, unparseable body | both |
+| `401 Unauthorized` | Missing/invalid `Authorization: Bearer` | api |
+| `403 Forbidden` | Origin/Referer rejected; or CSRF rejected | form |
+| `404 Not Found` | Path not configured | both |
+| `405 Method Not Allowed` | Not POST | both |
+| `409 Conflict` | `Idempotency-Key` matches an in-flight request | api |
+| `413 Payload Too Large` | Body exceeded `max_body_size` | both |
+| `415 Unsupported Media Type` | Body wasn't `application/json` | api |
+| `422 Unprocessable Entity` | Validation failed (required field, email format, invalid `to_override`) | both |
+| `429 Too Many Requests` | Rate limit exceeded (per IP in form, per API key in api) | both |
+| `500 Internal Server Error` | Template render failed | both |
+| `502 Bad Gateway` | Transport terminal failure (or 10s timeout) | both |
+
+See [Response codes](/reference/response-codes/) for the per-code error body shape and root causes.
+
+## Content negotiation
+
+Posthorn checks the `Accept` header to decide between JSON and redirect responses:
+
+| `Accept` header | Redirects configured? | Response |
+|---|---|---|
+| `application/json` (preferred) | (any) | JSON |
+| `text/html` (preferred) | Yes (success or error path) | 303 redirect |
+| `text/html` (preferred) | No | JSON (fallback) |
+| `*/*` | (any) | JSON |
+| Missing | (any) | JSON |
+
+Most fetch-based form submitters set `Accept: application/json` and get JSON. Most plain browser form submissions set `Accept: text/html` and get a redirect.
+
+## Client examples
+
+### JavaScript (fetch)
+
+```javascript
+const form = document.querySelector('form');
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const data = new FormData(form);
+  const res = await fetch('/api/contact', {
+    method: 'POST',
+    body: new URLSearchParams(data),
+    headers: { 'Accept': 'application/json' },
+  });
+  if (res.ok) {
+    // 200 → JSON: { status: "ok", submission_id: "..." }
+    const json = await res.json();
+    showSuccess(json.submission_id);
+  } else if (res.status === 422) {
+    // 422 → JSON: { error, code, fields: { fieldName: "required" | "invalid email format" } }
+    const json = await res.json();
+    showFieldErrors(json.fields);
+  } else if (res.status === 429) {
+    // Plaintext body; Posthorn doesn't emit a Retry-After header. Back off and retry.
+    showRateLimited();
+  } else {
+    // Plaintext body for 4xx/5xx other than 422. Use status code, not body text.
+    showGenericError(`HTTP ${res.status}`);
+  }
+});
+```
+
+### Plain HTML form (no JS)
+
+```html
+<form method="POST" action="/api/contact">
+  <input name="name" required>
+  <input name="email" type="email" required>
+  <textarea name="message" required></textarea>
+  <input type="text" name="_gotcha" tabindex="-1" autocomplete="off"
+         style="position:absolute;left:-9999px">
+  <button type="submit">Send</button>
+</form>
+```
+
+With `redirect_success = "/thank-you"` configured, a successful submission redirects to `/thank-you`. With `redirect_error = "/contact?error=1"`, validation failures redirect back to the form.
+
+### curl
+
+```bash
+# Success
+curl -X POST http://localhost:8080/api/contact \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "name=Test User&email=test@example.com&message=hello"
+
+# Multipart
+curl -X POST http://localhost:8080/api/contact \
+  -F name="Test User" -F email=test@example.com -F message=hello
+
+# Force JSON response
+curl -X POST http://localhost:8080/api/contact \
+  -H "Accept: application/json" \
+  -d "name=...&..."
+```
+
+## API mode
+
+For server-to-server callers (Cloudflare Workers, cron jobs, payment handlers), configure an endpoint with `auth = "api-key"`. The wire format is different: Bearer auth, JSON body, idempotency keys, per-request recipient override. Full reference: [API mode](/features/api-mode/).
+
+A minimal example:
+
+```http
+POST /api/transactional HTTP/1.1
+Authorization: Bearer abc123
+Content-Type: application/json
+Idempotency-Key: reset:user-42:2026-05-16T20
+
+{
+  "to_override": "alice@example.com",
+  "subject_line": "Reset your password",
+  "message": "https://app.example.com/reset/xyz"
+}
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{"status":"ok","submission_id":"..."}
+```
+
+## Not currently supported
+
+| Feature | When |
+|---|---|
+| File attachments | v2 |
+| Webhook transport (outbound + lifecycle event forwarding) | v2 |
+| Durable submission storage / retry queue across restarts | v2 |
+| Suppression list + automatic unsubscribe injection | v2 |
+| Multi-tenant routing / per-endpoint fan-out | v2 |

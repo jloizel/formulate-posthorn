@@ -1,0 +1,338 @@
+---
+title: Response codes
+description: Every HTTP status Posthorn can return, with example body and root cause.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A reference for every status code Posthorn returns, with example JSON body, root cause, and what to do about it.
+
+## 200 OK
+
+**Success** — submission accepted, transport returned success.
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{"status":"ok","submission_id":"7f2c84d6-9b1e-4c2f-a3b8-1a2b3c4d5e6f"}
+```
+
+Also returned silently when the **honeypot field is non-empty** (form-mode endpoints only). The honeypot path emits the *same* JSON shape — `status: "ok"` plus a fresh `submission_id` — so a bot inspecting the response body cannot tell honeypot rejection apart from a real success.
+
+```json
+{"status":"ok","submission_id":"a1b2c3d4-..."}
+```
+
+The submission_id on a honeypot 200 is a real UUIDv4 minted for that request; it's just never threaded into a transport send. If you grep your logs for that ID you'll see a `spam_blocked` event instead of `submission_sent`.
+
+**Dry-run 200** (endpoints with `dry_run = true`): runs the full pipeline up to but not including the transport, then returns the rendered message for inspection.
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+  "status": "dry_run",
+  "submission_id": "...",
+  "prepared_message": {
+    "from": "Contact <noreply@example.com>",
+    "to": ["alerts@example.com"],
+    "reply_to": "alice@example.com",
+    "subject": "Contact: Alice",
+    "body": "From: Alice ..."
+  }
+}
+```
+
+**Idempotent replay 200** (api-mode endpoints with an `Idempotency-Key` header that matches a cached prior request): returns the byte-identical original response — same status, same body, same `submission_id`. The second-or-later request never reaches the transport.
+
+## 303 See Other
+
+**Redirect** after content negotiation chose HTML-friendly response.
+
+```http
+HTTP/1.1 303 See Other
+Location: /thank-you
+```
+
+Returned when:
+
+- Client prefers `text/html` (e.g., default browser form submission)
+- `redirect_success` or `redirect_error` is configured for the endpoint
+- The submission has been processed (successfully or not)
+
+The 303 status — not 302 — ensures the browser issues a GET to the redirect URL, preventing form re-submission on refresh.
+
+## 401 Unauthorized
+
+**API-mode auth failure.** Plaintext body. Only emitted by endpoints configured with `auth = "api-key"`.
+
+```http
+HTTP/1.1 401 Unauthorized
+Content-Type: text/plain; charset=utf-8
+
+unauthorized
+```
+
+Common causes:
+
+| Cause | Fix |
+|---|---|
+| `Authorization` header missing | Send `Authorization: Bearer <key>` |
+| Header present but format isn't `Bearer <key>` | Fix the prefix; must be exactly `Bearer ` followed by the key |
+| Key value doesn't match any entry in `api_keys` | Confirm the env var is set on the calling side; rotate if leaked |
+
+The constant-time compare against every configured key fires on **every** 401, so timing analysis can't enumerate the set.
+
+**Brute-force defense:** Posthorn tracks failed-auth attempts per client IP. After 10 failures from the same IP within ~1 minute, subsequent failed attempts return 429 (see below) until the budget refills. Successful auths never consume the budget — legitimate callers are unaffected.
+
+## 400 Bad Request
+
+**Malformed request.** Plaintext body.
+
+```http
+HTTP/1.1 400 Bad Request
+Content-Type: text/plain; charset=utf-8
+
+form-encoded body required (application/x-www-form-urlencoded or multipart/form-data)
+```
+
+Or, for a body that couldn't be parsed:
+
+```text
+malformed request body
+```
+
+The parser's internal error is not echoed to the client (it's logged server-side as `body_parse_failed`). API-mode endpoints additionally return the specific shape violation for JSON that parses but isn't a flat object (e.g. `nested objects are not supported`). In form mode, if `redirect_error` is configured and the request prefers HTML (no `Accept: application/json`), a malformed body redirects (303) to the error page — the same content-negotiated behavior as a validation failure — rather than returning the 400 body.
+
+Common causes:
+
+| Cause | Fix |
+|---|---|
+| Wrong content type (e.g., `application/json`) | Send as form-encoded |
+| Multipart body with truncated boundary | Fix the client encoder |
+| URL-encoded body with malformed escapes (`%XX` where `XX` isn't hex) | Fix the client encoder |
+
+## 403 Forbidden
+
+**Origin/Referer rejected** by the `allowed_origins` check. Plaintext body.
+
+```http
+HTTP/1.1 403 Forbidden
+Content-Type: text/plain; charset=utf-8
+
+forbidden
+```
+
+The reason (which exact check fired — bad origin, bad referer, both headers missing) is in the structured `spam_blocked` log event, not in the response. Bots don't get to learn which defense caught them.
+
+Common causes:
+
+| Cause | Fix |
+|---|---|
+| Form on `evil.example.com` trying to POST to a Posthorn endpoint configured for `example.com` | Don't, or add the new origin |
+| Direct-POST bot with no Origin or Referer headers | Working as intended — reject |
+| Server-to-server submission (curl, internal cron) without Origin/Referer | Either set headers in the client, or skip `allowed_origins` for that endpoint |
+| Header stripping at the reverse proxy | Configure your proxy to forward `Origin` and `Referer` |
+
+## 404 Not Found
+
+**No endpoint configured for this path.** Plaintext body from the standard-library mux.
+
+```http
+HTTP/1.1 404 Not Found
+Content-Type: text/plain; charset=utf-8
+
+404 page not found
+```
+
+The URL path doesn't match any `[[endpoints]]` `path` in the config. Posthorn doesn't reveal which paths *are* configured (so attackers can't enumerate by probing).
+
+## 405 Method Not Allowed
+
+**Wrong method** (anything but POST). Plaintext body.
+
+```http
+HTTP/1.1 405 Method Not Allowed
+Content-Type: text/plain; charset=utf-8
+
+method not allowed
+```
+
+Common causes:
+
+| Cause | Fix |
+|---|---|
+| GET request to an endpoint (e.g., navigating to it directly) | Always POST |
+| Browser preflight `OPTIONS` request | Configure CORS at the reverse proxy if needed |
+
+## 409 Conflict
+
+**Idempotency-Key collision in flight.** Plaintext body. Only emitted by api-mode endpoints.
+
+```http
+HTTP/1.1 409 Conflict
+Content-Type: text/plain; charset=utf-8
+
+duplicate request in flight for this Idempotency-Key
+```
+
+Returned when a second request arrives with an `Idempotency-Key` that's still being processed by an earlier in-flight request (the upstream transport hasn't returned yet). Posthorn surfaces this as 409 rather than silently blocking, so a misbehaving caller retrying without backoff sees the conflict instead of latency.
+
+Common causes:
+
+| Cause | Fix |
+|---|---|
+| Caller retried before the first request's response came back | Wait for the first response; the cached result will be served on subsequent retries |
+| Two distinct callers happen to generate the same key | Make keys caller-scoped, e.g. include a user/session prefix |
+
+A *completed* request with the same key returns the cached **200** (not 409). 409 specifically means "I'm still working on the first one."
+
+## 415 Unsupported Media Type
+
+**API-mode endpoint received a non-JSON body.** Plaintext body. Only emitted by endpoints configured with `auth = "api-key"`.
+
+```http
+HTTP/1.1 415 Unsupported Media Type
+Content-Type: text/plain; charset=utf-8
+
+JSON body required (application/json)
+```
+
+Common causes:
+
+| Cause | Fix |
+|---|---|
+| Caller posted form-encoded body to an api-mode endpoint | Send `Content-Type: application/json` and a JSON object body |
+| Missing `Content-Type` header | Add the header explicitly |
+
+API-mode endpoints reject form bodies at parse time; form-mode endpoints reject JSON bodies at parse time (returning 400). The mode is fixed at config-load time by the `auth` field.
+
+## 413 Payload Too Large
+
+**Body exceeded `max_body_size`.** Plaintext body — includes the cap so a client integrator knows what to compare against.
+
+```http
+HTTP/1.1 413 Request Entity Too Large
+Content-Type: text/plain; charset=utf-8
+
+request body too large (limit: 1048576 bytes)
+```
+
+The cap is the byte count of the resolved `max_body_size`. Default is 1 MB (1048576 bytes) when unset. The structured log line on the operator side carries the same number in the `limit_bytes` field of the `body_too_large` event.
+
+Common causes:
+
+| Cause | Fix |
+|---|---|
+| Form with very long text fields | Either trim client-side, increase `max_body_size`, or reject the input |
+| File upload (since attachments aren't supported, large files still hit this cap) | Don't upload files; v2 will support attachments |
+| Bot trying to exhaust resources | Working as intended — reject |
+
+## 422 Unprocessable Entity
+
+**Validation failure** — required field missing or email malformed. JSON body (Posthorn's primary structured-error path).
+
+```http
+HTTP/1.1 422 Unprocessable Entity
+Content-Type: application/json; charset=utf-8
+
+{"error":"validation failed","code":"validation_failed","fields":{"name":"required","email":"invalid email format"}}
+```
+
+Per-field messages are terse machine-parseable strings (`"required"`, `"invalid email format"`) — your form code maps them to whatever UI copy you want.
+
+The `fields` object enumerates **every** failing field; the response isn't short-circuit. This lets clients display all errors at once.
+
+Common causes:
+
+| Cause | Fix |
+|---|---|
+| User submitted a form with empty required fields | Display field-level errors in the UI |
+| Submitter typed an email like `alice@`, `alice`, or empty | Same — validate at the client too |
+| Field name typo in config (`requried = ...`) | Fix the typo; `posthorn validate` would have caught it |
+
+## 429 Too Many Requests
+
+**Rate limit exceeded.** Plaintext body. Two distinct paths trigger 429:
+
+1. The configured `rate_limit` bucket emptied for this client IP (form mode) or matched API key (API mode):
+
+   ```http
+   HTTP/1.1 429 Too Many Requests
+   Content-Type: text/plain; charset=utf-8
+
+   rate limit exceeded
+   ```
+
+2. The brute-force defense fired on an API-mode endpoint — 10 failed-auth attempts from the same IP within ~1 minute. Subsequent failed-auth attempts from that IP return 429 instead of 401 until the budget refills:
+
+   ```http
+   HTTP/1.1 429 Too Many Requests
+   Content-Type: text/plain; charset=utf-8
+
+   too many failed authentication attempts
+   ```
+
+A `Retry-After` header is **not** emitted — the client is expected to back off. (Adding `Retry-After` derived from token-bucket state is a planned polish item.)
+
+Common causes:
+
+| Cause | Fix |
+|---|---|
+| Real abuse — bot or attacker hitting the form | Working as intended |
+| Brute-force scanner cycling through API-key guesses | Working as intended — the failure budget locks the IP out for ~1 minute |
+| Legitimate user double-clicked submit | Tune `rate_limit` upward, or disable double-submit at the client |
+| Multiple legitimate users behind shared Network Address Translation (NAT) or Carrier-Grade NAT (CGNAT) all hitting the form | Tune `rate_limit` upward, or accept the false-positive rate |
+| Bad `trusted_proxies` config — Posthorn sees the proxy IP, every request looks like the same IP | Set `trusted_proxies` to your reverse proxy's Classless Inter-Domain Routing (CIDR) range |
+
+## 502 Bad Gateway
+
+**Transport terminal failure** — the upstream provider rejected the message or the 10-second timeout fired. Plaintext body.
+
+```http
+HTTP/1.1 502 Bad Gateway
+Content-Type: text/plain; charset=utf-8
+
+submission could not be delivered
+```
+
+The submission ID is still logged for recovery; the response body is intentionally vague — exposing transport details to the requesting client could leak information about your account or configuration. Operator-facing detail (provider name, upstream status, error class) is in the `submission_failed` structured log line.
+
+Common causes:
+
+| Cause | Fix |
+|---|---|
+| `401` from the provider — bad API key | Check `${env.PROVIDER_API_KEY}` is set and matches a valid token |
+| `422` from the provider — `From:` not on a verified domain | Verify your sending domain in the provider's dashboard |
+| `422` from the provider — invalid recipient (e.g., disposable email) | Display a better validation error; the provider won't deliver |
+| Transient `5xx` from the provider after retry exhausted | Wait and re-try; the operator's recovery path is the failure log |
+| 10s timeout — slow upstream | Check the provider's status page; if persistent, escalate |
+| Network failure during retry | Same |
+
+<Aside type="caution">
+On 502, the submission's form payload is logged at ERROR level (unless `log_failed_submissions = false`). Read your logs to recover the data and send manually if needed. There is no persistent queue; the failed submission only lives in the log. A durable retry queue is planned for v2.
+</Aside>
+
+## 500 Internal Server Error
+
+**Posthorn-internal failure** — template render failed, or some other server-side error that isn't the upstream's fault. Plaintext body.
+
+```http
+HTTP/1.1 500 Internal Server Error
+Content-Type: text/plain; charset=utf-8
+
+submission could not be processed
+```
+
+Usually a configuration bug (malformed template that passed `posthorn validate` but errored on real input). The structured log line carries the underlying error.
+
+## What you never see
+
+| Status | Why not |
+|---|---|
+| `301 Moved Permanently` | Not used |
+| `307 Temporary Redirect` | Form re-POSTs are bad UX; we use 303 instead |
+| `503 Service Unavailable` | The 502 catch-all subsumes this |
+| `504 Gateway Timeout` | The 502 catch-all subsumes this |

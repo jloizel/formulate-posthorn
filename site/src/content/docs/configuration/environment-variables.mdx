@@ -1,0 +1,117 @@
+---
+title: Environment variables
+description: Inject secrets into the config via ${env.VAR} placeholders.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Posthorn resolves environment variables inside its TOML config via `${env.VAR}` placeholders. Resolution happens as a post-parse pass over every string field — anywhere a string is valid, a placeholder is valid.
+
+## Why placeholders, not env-var-only secrets?
+
+Two reasons:
+
+1. **Multiple keys per process.** A single Posthorn instance can use distinct Postmark tokens for different endpoints (transactional vs. broadcast, for example). Env-var-only would require namespaced conventions; placeholders let you name them naturally.
+2. **Auditable config.** The TOML is the source of truth for everything except secret values. You can diff config changes meaningfully without redacting half the file.
+
+## Syntax
+
+```toml
+api_key = "${env.POSTMARK_API_KEY}"
+```
+
+Variable names match `[A-Z_][A-Z0-9_]*` (UPPER_SNAKE_CASE, POSIX conventions). Placeholders can appear anywhere inside a string field — including alongside literal text:
+
+```toml
+# Allowed: literal prefix + placeholder
+custom_header = "Bearer ${env.WORKER_KEY_PRIMARY}"
+```
+
+Transports that need specific header formats (Postmark's `X-Postmark-Server-Token`, Resend's `Authorization: Bearer`, Mailgun's HTTP Basic, SES's signed `Authorization`) construct those formats internally — the operator just supplies the raw key as `api_key = "${env....}"`.
+
+## Where placeholders make sense
+
+| Field | Typical placeholder |
+|---|---|
+| `endpoints.transport.settings.api_key` | `${env.POSTMARK_API_KEY}` |
+| `endpoints.from` | usually literal, occasionally `"Contact <${env.NOREPLY_ADDR}>"` when the noreply address rotates between environments |
+| Anything else with a string value | Allowed but rarely useful |
+
+## Resolution order
+
+1. Posthorn reads the raw TOML file from disk.
+2. Every `${env.VAR}` placeholder is replaced with `os.LookupEnv("VAR")` — this happens *before* TOML parsing, so the parser only ever sees resolved values.
+3. TOML is parsed and validated.
+
+**Unset variables** (where `os.LookupEnv` returns `ok=false`) collect into a single error so operators don't play whack-a-mole on first run. **Empty-string env vars** (set but to `""`) resolve normally — the empty string flows through to the field. If the field's validator requires non-empty (`api_key`, `from`, etc.), that downstream validator will surface the failure with a clearer message.
+
+## Missing env vars
+
+A missing `${env.VAR}` is a **config error**, not a runtime error. `posthorn validate` will surface every missing variable in one shot before the listener starts:
+
+```
+$ posthorn validate --config posthorn.toml
+config: env var(s) not set: POSTMARK_API_KEY, WORKER_KEY_PRIMARY
+exit status 1
+```
+
+This means deployment health checks can use `posthorn validate` as a precondition before swapping pods.
+
+## What never appears in logs
+
+API keys configured via `${env.VAR}` placeholders **never appear in any log output.** Posthorn enforces this in two places:
+
+- The transport implementation sets the API key as an HTTP header (`X-Postmark-Server-Token`); it's never logged as part of error or debug output.
+- Tests trigger transport failures and assert that the resolved key string does not appear in captured log output.
+
+See [API keys](/security/api-keys/) for the full guarantee.
+
+## Docker examples
+
+### With an env file
+
+```yaml
+services:
+  posthorn:
+    image: ghcr.io/craigmccaskill/posthorn:latest
+    env_file: .env
+    # ...
+```
+
+```bash
+# .env
+POSTMARK_API_KEY=abc123def456
+```
+
+### With Docker secrets
+
+```yaml
+services:
+  posthorn:
+    image: ghcr.io/craigmccaskill/posthorn:latest
+    secrets:
+      - postmark_key
+    entrypoint:
+      - sh
+      - -c
+      - 'export POSTMARK_API_KEY=$$(cat /run/secrets/postmark_key) && exec posthorn serve --config /etc/posthorn/config.toml'
+
+secrets:
+  postmark_key:
+    file: ./postmark_key.txt
+```
+
+<Aside type="note">
+Docker secrets are mounted as files, not env vars. The wrapper above reads the file and re-exports it as an env var so `${env.POSTMARK_API_KEY}` resolves. For Kubernetes, use a `Secret` mounted as env via `valueFrom.secretKeyRef`.
+</Aside>
+
+### With direct env vars (compose override)
+
+```yaml
+services:
+  posthorn:
+    image: ghcr.io/craigmccaskill/posthorn:latest
+    environment:
+      POSTMARK_API_KEY: ${POSTMARK_API_KEY}  # passes from host env
+```
+

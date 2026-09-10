@@ -1,0 +1,1005 @@
+package config_test
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/craigmccaskill/posthorn/config"
+)
+
+// minimalTOML is the smallest valid config used as a baseline across many
+// tests. Tests that need to break a specific field rebuild the string
+// rather than mutating shared state, so each test stays independent.
+const minimalTOML = `
+[[endpoints]]
+path = "/api/contact"
+to = ["craig@example.com"]
+from = "noreply@example.com"
+subject = "Contact"
+body = "Body"
+
+[endpoints.transport]
+type = "postmark"
+
+[endpoints.transport.settings]
+api_key = "test-key"
+`
+
+// writeConfig writes content to a temp file and returns the path.
+func writeConfig(t *testing.T, content string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	return path
+}
+
+// loadString is a helper for tests that want to pass TOML inline rather
+// than thread a temp-file path through every assertion.
+func loadString(t *testing.T, content string) (*config.Config, error) {
+	t.Helper()
+	return config.Load(writeConfig(t, content))
+}
+
+func TestLoad_Success_MinimalConfig(t *testing.T) {
+	cfg, err := loadString(t, minimalTOML)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(cfg.Endpoints); got != 1 {
+		t.Fatalf("Endpoints length = %d, want 1", got)
+	}
+	ep := cfg.Endpoints[0]
+	if ep.Path != "/api/contact" {
+		t.Errorf("Path = %q, want %q", ep.Path, "/api/contact")
+	}
+	if got := ep.Transport.Type; got != "postmark" {
+		t.Errorf("Transport.Type = %q", got)
+	}
+	if got, _ := ep.Transport.Settings["api_key"].(string); got != "test-key" {
+		t.Errorf("api_key = %q", got)
+	}
+}
+
+func TestLoad_Success_FullConfig(t *testing.T) {
+	full := `
+[[endpoints]]
+path = "/api/contact"
+to = ["craig@example.com", "support@example.com"]
+from = "Contact <noreply@example.com>"
+trusted_proxies = ["10.0.0.0/8"]
+honeypot = "_gotcha"
+allowed_origins = ["https://example.com"]
+max_body_size = "32KB"
+required = ["name", "email", "message"]
+email_field = "email"
+subject = "Contact from {{.name}}"
+body = "From: {{.email}}\n\n{{.message}}"
+log_failed_submissions = false
+redirect_success = "/thank-you"
+redirect_error = "/contact?error=true"
+
+[endpoints.transport]
+type = "postmark"
+
+[endpoints.transport.settings]
+api_key = "test-key"
+
+[endpoints.rate_limit]
+count = 5
+interval = "1m"
+
+[logging]
+level = "info"
+format = "json"
+`
+	cfg, err := loadString(t, full)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	ep := cfg.Endpoints[0]
+	if got := len(ep.To); got != 2 {
+		t.Errorf("To length = %d, want 2", got)
+	}
+	if ep.RateLimit == nil {
+		t.Fatal("RateLimit unset")
+	}
+	if ep.RateLimit.Count != 5 {
+		t.Errorf("RateLimit.Count = %d, want 5", ep.RateLimit.Count)
+	}
+	if got := ep.RateLimit.Interval.Std(); got != time.Minute {
+		t.Errorf("RateLimit.Interval = %v, want 1m", got)
+	}
+	if ep.LogFailedSubmissions == nil {
+		t.Fatal("LogFailedSubmissions: pointer nil; expected explicit false")
+	}
+	if *ep.LogFailedSubmissions {
+		t.Error("LogFailedSubmissions should be false")
+	}
+}
+
+func TestLoad_MultipleEndpoints(t *testing.T) {
+	multi := minimalTOML + `
+[[endpoints]]
+path = "/api/newsletter"
+to = ["news@example.com"]
+from = "noreply@example.com"
+subject = "Newsletter signup"
+body = "Body"
+
+[endpoints.transport]
+type = "postmark"
+
+[endpoints.transport.settings]
+api_key = "test-key"
+`
+	cfg, err := loadString(t, multi)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(cfg.Endpoints); got != 2 {
+		t.Fatalf("Endpoints length = %d, want 2", got)
+	}
+	if cfg.Endpoints[0].Path != "/api/contact" {
+		t.Errorf("[0].Path = %q", cfg.Endpoints[0].Path)
+	}
+	if cfg.Endpoints[1].Path != "/api/newsletter" {
+		t.Errorf("[1].Path = %q", cfg.Endpoints[1].Path)
+	}
+}
+
+func TestLoad_FileNotFound(t *testing.T) {
+	_, err := config.Load("/nonexistent/path/to/config.toml")
+	if err == nil {
+		t.Fatal("Load: expected error for missing file")
+	}
+	if !strings.Contains(err.Error(), "read config") {
+		t.Errorf("error should mention 'read config': %v", err)
+	}
+}
+
+func TestLoad_InvalidTOML(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{"unclosed_string", `path = "no closing quote`},
+		{"malformed_table", `[[[endpoints`},
+		{"trailing_garbage", "endpoints = 5\n[broken syntax"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := loadString(t, tt.content)
+			if err == nil {
+				t.Fatal("expected parse error")
+			}
+			if !strings.Contains(err.Error(), "parse TOML") {
+				t.Errorf("error should mention 'parse TOML': %v", err)
+			}
+		})
+	}
+}
+
+// --- Validation: top-level ---
+
+func TestValidate_NoIngress(t *testing.T) {
+	// Neither [[endpoints]] nor [smtp_listener] — nothing to serve.
+	_, err := loadString(t, "[logging]\nformat = \"json\"\n")
+	if err == nil || !strings.Contains(err.Error(), "at least one ingress") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_SMTPListenerOnly(t *testing.T) {
+	// An [smtp_listener] block with zero [[endpoints]] is a first-class
+	// deployment shape (the Ghost/Gitea recipes); it must validate.
+	// Regression test for issue #37.
+	c := `
+[smtp_listener]
+listen          = ":2525"
+allowed_senders = ["*@example.com"]
+
+[[smtp_listener.smtp_users]]
+username = "u"
+password = "p"
+
+[smtp_listener.transport]
+type = "postmark"
+
+[smtp_listener.transport.settings]
+api_key = "test-key"
+`
+	cfg, err := loadString(t, c)
+	if err != nil {
+		t.Fatalf("smtp_listener-only config should validate, got: %v", err)
+	}
+	if len(cfg.Endpoints) != 0 || cfg.SMTPListener == nil {
+		t.Fatalf("unexpected shape: endpoints=%d listener=%v", len(cfg.Endpoints), cfg.SMTPListener)
+	}
+}
+
+// --- Validation: smtp_listener auth_required="none" bind check (#41) ---
+
+// listenerAuthNoneTOML builds an smtp_listener block with the given
+// listen address and extra lines, appended to a minimal valid endpoint.
+func listenerAuthNoneTOML(listen, extra string) string {
+	return minimalTOML + `
+[smtp_listener]
+listen          = "` + listen + `"
+auth_required   = "none"
+require_tls     = false
+allowed_senders = ["*@example.com"]
+` + extra + `
+[smtp_listener.transport]
+type = "postmark"
+
+[smtp_listener.transport.settings]
+api_key = "test-key"
+`
+}
+
+func TestValidate_SMTPAuthNone_PublicBindRefused(t *testing.T) {
+	for _, listen := range []string{":2525", "0.0.0.0:2525", "[::]:2525", "203.0.113.5:2525", "smtp.example.com:2525"} {
+		t.Run(listen, func(t *testing.T) {
+			_, err := loadString(t, listenerAuthNoneTOML(listen, ""))
+			if err == nil {
+				t.Fatalf("auth_required=none with listen %q should be refused", listen)
+			}
+			if !strings.Contains(err.Error(), "trusted_network") {
+				t.Errorf("error should name the trusted_network override: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidate_SMTPAuthNone_PrivateBindAccepted(t *testing.T) {
+	for _, listen := range []string{"127.0.0.1:2525", "localhost:2525", "10.1.2.3:2525", "192.168.1.5:2525", "[::1]:2525"} {
+		t.Run(listen, func(t *testing.T) {
+			if _, err := loadString(t, listenerAuthNoneTOML(listen, "")); err != nil {
+				t.Errorf("auth_required=none with private listen %q should validate, got: %v", listen, err)
+			}
+		})
+	}
+}
+
+func TestValidate_SMTPAuthNone_TrustedNetworkOverride(t *testing.T) {
+	// The explicit ack clears the public-bind refusal — the Docker
+	// pattern where 0.0.0.0 inside the container is fronted by the
+	// container network.
+	if _, err := loadString(t, listenerAuthNoneTOML(":2525", "trusted_network = true\n")); err != nil {
+		t.Errorf("trusted_network=true should clear the refusal, got: %v", err)
+	}
+}
+
+func TestValidate_SMTPAuthDefault_PublicBindAccepted(t *testing.T) {
+	// The bind check applies only to auth_required="none"; an
+	// authenticated listener may bind anywhere.
+	c := minimalTOML + `
+[smtp_listener]
+listen          = ":2525"
+allowed_senders = ["*@example.com"]
+
+[[smtp_listener.smtp_users]]
+username = "u"
+password = "p"
+
+[smtp_listener.transport]
+type = "postmark"
+
+[smtp_listener.transport.settings]
+api_key = "test-key"
+`
+	if _, err := loadString(t, c); err != nil {
+		t.Errorf("authenticated listener on :2525 should validate, got: %v", err)
+	}
+}
+
+func TestValidate_SMTPListener_NegativeConnCaps(t *testing.T) {
+	c := listenerAuthNoneTOML("127.0.0.1:2525", "max_connections = -1\n")
+	if _, err := loadString(t, c); err == nil || !strings.Contains(err.Error(), "max_connections") {
+		t.Errorf("negative max_connections should be refused: %v", err)
+	}
+	c = listenerAuthNoneTOML("127.0.0.1:2525", "max_connections_per_ip = -1\n")
+	if _, err := loadString(t, c); err == nil || !strings.Contains(err.Error(), "max_connections_per_ip") {
+		t.Errorf("negative max_connections_per_ip should be refused: %v", err)
+	}
+}
+
+func TestValidate_DuplicatePath(t *testing.T) {
+	dup := minimalTOML + minimalTOML
+	_, err := loadString(t, dup)
+	if err == nil || !strings.Contains(err.Error(), "duplicate endpoint path") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+// --- Validation: endpoint required fields ---
+
+func TestValidate_PathRequired(t *testing.T) {
+	noPath := strings.Replace(minimalTOML, `path = "/api/contact"`, "", 1)
+	_, err := loadString(t, noPath)
+	if err == nil || !strings.Contains(err.Error(), "path is required") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_PathMustStartWithSlash(t *testing.T) {
+	bad := strings.Replace(minimalTOML, `path = "/api/contact"`, `path = "api/contact"`, 1)
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "must start with /") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_ToRequired(t *testing.T) {
+	noTo := strings.Replace(minimalTOML, `to = ["craig@example.com"]`, "", 1)
+	_, err := loadString(t, noTo)
+	if err == nil || !strings.Contains(err.Error(), "to is required") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_ToInvalidEmail(t *testing.T) {
+	bad := strings.Replace(minimalTOML, `to = ["craig@example.com"]`, `to = ["not-an-email"]`, 1)
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "to: invalid email") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_FromRequired(t *testing.T) {
+	noFrom := strings.Replace(minimalTOML, `from = "noreply@example.com"`, "", 1)
+	_, err := loadString(t, noFrom)
+	if err == nil || !strings.Contains(err.Error(), "from is required") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_FromInvalidEmail(t *testing.T) {
+	bad := strings.Replace(minimalTOML, `from = "noreply@example.com"`, `from = "not-an-email"`, 1)
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "from: invalid email") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_SubjectRequired(t *testing.T) {
+	noSubj := strings.Replace(minimalTOML, `subject = "Contact"`, "", 1)
+	_, err := loadString(t, noSubj)
+	if err == nil || !strings.Contains(err.Error(), "subject is required") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_BodyRequired(t *testing.T) {
+	noBody := strings.Replace(minimalTOML, `body = "Body"`, "", 1)
+	_, err := loadString(t, noBody)
+	if err == nil || !strings.Contains(err.Error(), "body is required") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+// --- Validation: transport ---
+
+func TestValidate_TransportTypeRequired(t *testing.T) {
+	noType := strings.Replace(minimalTOML, `type = "postmark"`, "", 1)
+	_, err := loadString(t, noType)
+	if err == nil || !strings.Contains(err.Error(), "type is required") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_UnknownTransportType(t *testing.T) {
+	wrong := strings.Replace(minimalTOML, `type = "postmark"`, `type = "nonsense-transport"`, 1)
+	_, err := loadString(t, wrong)
+	if err == nil || !strings.Contains(err.Error(), "unknown transport type") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_PostmarkAPIKeyRequired(t *testing.T) {
+	noKey := strings.Replace(minimalTOML, `api_key = "test-key"`, "", 1)
+	_, err := loadString(t, noKey)
+	if err == nil || !strings.Contains(err.Error(), "settings.api_key") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+// --- Validation: NFR4 — allowed_origins explicitly empty ---
+
+func TestValidate_AllowedOriginsExplicitlyEmpty(t *testing.T) {
+	// allowed_origins must be injected inside the endpoint block before
+	// the [endpoints.transport] sub-table, so build the TOML manually.
+	bad := `
+[[endpoints]]
+path = "/api/contact"
+to = ["craig@example.com"]
+from = "noreply@example.com"
+subject = "Contact"
+body = "Body"
+allowed_origins = []
+
+[endpoints.transport]
+type = "postmark"
+
+[endpoints.transport.settings]
+api_key = "test-key"
+`
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "allowed_origins is explicitly empty") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_AllowedOriginsAbsent_OK(t *testing.T) {
+	// No allowed_origins key at all means "allow any origin" (FR6, fail-open
+	// by absence of config). This must NOT error.
+	if _, err := loadString(t, minimalTOML); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+}
+
+// --- Validation: rate limit ---
+
+func TestValidate_RateLimitCountMustBePositive(t *testing.T) {
+	bad := minimalTOML + `
+[endpoints.rate_limit]
+count = 0
+interval = "1m"
+`
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "rate_limit.count") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_RateLimitIntervalMustBePositive(t *testing.T) {
+	bad := minimalTOML + `
+[endpoints.rate_limit]
+count = 5
+interval = "0s"
+`
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "rate_limit.interval") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+// --- Validation: logging ---
+
+func TestValidate_LoggingFormat(t *testing.T) {
+	bad := minimalTOML + `
+[logging]
+format = "logfmt"
+`
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "logging.format") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_LoggingLevel(t *testing.T) {
+	bad := minimalTOML + `
+[logging]
+level = "verbose"
+`
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "logging.level") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_LoggingLevels_Accepted(t *testing.T) {
+	for _, lvl := range []string{"", "debug", "info", "warn", "error"} {
+		t.Run(lvl, func(t *testing.T) {
+			c := minimalTOML
+			if lvl != "" {
+				c += "\n[logging]\nlevel = \"" + lvl + "\"\n"
+			}
+			if _, err := loadString(t, c); err != nil {
+				t.Errorf("level %q rejected: %v", lvl, err)
+			}
+		})
+	}
+}
+
+// --- Env var resolution ---
+
+func TestLoad_EnvVarResolution(t *testing.T) {
+	t.Setenv("POSTMARK_API_KEY", "secret-token-from-env")
+	c := strings.Replace(minimalTOML, `api_key = "test-key"`, `api_key = "${env.POSTMARK_API_KEY}"`, 1)
+
+	cfg, err := loadString(t, c)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, _ := cfg.Endpoints[0].Transport.Settings["api_key"].(string)
+	if got != "secret-token-from-env" {
+		t.Errorf("api_key = %q, want %q", got, "secret-token-from-env")
+	}
+}
+
+func TestLoad_EnvVarResolution_MultipleVars(t *testing.T) {
+	t.Setenv("RECIP", "ops@example.com")
+	t.Setenv("SENDER", "noreply@example.com")
+	t.Setenv("KEY", "k")
+	c := `
+[[endpoints]]
+path = "/x"
+to = ["${env.RECIP}"]
+from = "${env.SENDER}"
+subject = "s"
+body = "b"
+
+[endpoints.transport]
+type = "postmark"
+
+[endpoints.transport.settings]
+api_key = "${env.KEY}"
+`
+	cfg, err := loadString(t, c)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Endpoints[0].To[0] != "ops@example.com" {
+		t.Errorf("to = %v", cfg.Endpoints[0].To)
+	}
+	if cfg.Endpoints[0].From != "noreply@example.com" {
+		t.Errorf("from = %q", cfg.Endpoints[0].From)
+	}
+}
+
+func TestLoad_EnvVarMissing(t *testing.T) {
+	// Make sure the var is unset for this test even if the test environment
+	// has it set globally.
+	t.Setenv("DEFINITELY_UNSET_FOR_THIS_TEST", "x")
+	_ = os.Unsetenv("DEFINITELY_UNSET_FOR_THIS_TEST")
+
+	c := strings.Replace(minimalTOML, `api_key = "test-key"`, `api_key = "${env.DEFINITELY_UNSET_FOR_THIS_TEST}"`, 1)
+	_, err := loadString(t, c)
+	if err == nil {
+		t.Fatal("Load: expected error for missing env var")
+	}
+	if !strings.Contains(err.Error(), "DEFINITELY_UNSET_FOR_THIS_TEST") {
+		t.Errorf("error should name the unset var: %v", err)
+	}
+}
+
+func TestLoad_EnvVarMissing_AllReportedTogether(t *testing.T) {
+	// Operators benefit from seeing all unset vars at once rather than
+	// re-running on each fix. Verify the loader collects them.
+	_ = os.Unsetenv("MISSING_A")
+	_ = os.Unsetenv("MISSING_B")
+
+	c := `
+[[endpoints]]
+path = "/x"
+to = ["${env.MISSING_A}"]
+from = "${env.MISSING_B}"
+subject = "s"
+body = "b"
+
+[endpoints.transport]
+type = "postmark"
+
+[endpoints.transport.settings]
+api_key = "k"
+`
+	_, err := loadString(t, c)
+	if err == nil {
+		t.Fatal("expected error for missing env vars")
+	}
+	if !strings.Contains(err.Error(), "MISSING_A") {
+		t.Errorf("error should mention MISSING_A: %v", err)
+	}
+	if !strings.Contains(err.Error(), "MISSING_B") {
+		t.Errorf("error should mention MISSING_B: %v", err)
+	}
+}
+
+func TestLoad_EnvVar_NoPlaceholders_Passthrough(t *testing.T) {
+	// Sanity: a config with no ${env.X} placeholders should load without
+	// touching the environment.
+	if _, err := loadString(t, minimalTOML); err != nil {
+		t.Errorf("Load: %v", err)
+	}
+}
+
+// --- v1.1: API mode (auth, api_keys) ---
+
+// minimalAPITOML is the baseline valid api-mode config used across v1.1 tests.
+const minimalAPITOML = `
+[[endpoints]]
+path = "/api/transactional"
+to = ["craig@example.com"]
+from = "noreply@example.com"
+subject = "Transactional"
+body = "Body"
+auth = "api-key"
+api_keys = ["worker-key-1"]
+
+[endpoints.transport]
+type = "postmark"
+
+[endpoints.transport.settings]
+api_key = "test-key"
+`
+
+// TestValidate_DefaultAuth_FormMode pins FR45: v1.0 configs without an auth
+// field continue to parse and load as form-mode.
+func TestValidate_DefaultAuth_FormMode(t *testing.T) {
+	cfg, err := loadString(t, minimalTOML)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Endpoints[0].Auth; got != "" {
+		t.Errorf("Auth = %q, want \"\" (unset; defaults to form)", got)
+	}
+}
+
+func TestValidate_ExplicitFormAuth(t *testing.T) {
+	c := strings.Replace(minimalTOML, "body = \"Body\"", "body = \"Body\"\nauth = \"form\"", 1)
+	cfg, err := loadString(t, c)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Endpoints[0].Auth; got != "form" {
+		t.Errorf("Auth = %q, want \"form\"", got)
+	}
+}
+
+func TestValidate_APIKeyMode_Success(t *testing.T) {
+	cfg, err := loadString(t, minimalAPITOML)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	ep := cfg.Endpoints[0]
+	if ep.Auth != "api-key" {
+		t.Errorf("Auth = %q", ep.Auth)
+	}
+	if len(ep.APIKeys) != 1 || ep.APIKeys[0] != "worker-key-1" {
+		t.Errorf("APIKeys = %v", ep.APIKeys)
+	}
+}
+
+func TestValidate_InvalidAuthValue(t *testing.T) {
+	bad := strings.Replace(minimalTOML, "body = \"Body\"", "body = \"Body\"\nauth = \"oauth\"", 1)
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "auth: must be") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_APIKeyMode_RequiresAPIKeys(t *testing.T) {
+	bad := `
+[[endpoints]]
+path = "/api/transactional"
+to = ["craig@example.com"]
+from = "noreply@example.com"
+subject = "S"
+body = "B"
+auth = "api-key"
+
+[endpoints.transport]
+type = "postmark"
+
+[endpoints.transport.settings]
+api_key = "test-key"
+`
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "api_keys: at least one key required") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_APIKeyMode_EmptyAPIKeysList(t *testing.T) {
+	bad := strings.Replace(minimalAPITOML, `api_keys = ["worker-key-1"]`, `api_keys = []`, 1)
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "api_keys: at least one key required") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_APIKeyMode_EmptyKeyString(t *testing.T) {
+	bad := strings.Replace(minimalAPITOML, `api_keys = ["worker-key-1"]`, `api_keys = ["worker-key-1", ""]`, 1)
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "api_keys[1]: empty key") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_APIKeyMode_RejectsHoneypot(t *testing.T) {
+	bad := strings.Replace(minimalAPITOML, `body = "Body"`, `body = "Body"`+"\nhoneypot = \"_gotcha\"", 1)
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "honeypot: not valid on auth=\"api-key\"") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_APIKeyMode_RejectsAllowedOrigins(t *testing.T) {
+	bad := strings.Replace(minimalAPITOML, `body = "Body"`, `body = "Body"`+"\nallowed_origins = [\"https://x.com\"]", 1)
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "allowed_origins: not valid on auth=\"api-key\"") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_APIKeyMode_RejectsRedirectSuccess(t *testing.T) {
+	bad := strings.Replace(minimalAPITOML, `body = "Body"`, `body = "Body"`+"\nredirect_success = \"/ok\"", 1)
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "redirect_success: not valid on auth=\"api-key\"") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_APIKeyMode_RejectsRedirectError(t *testing.T) {
+	bad := strings.Replace(minimalAPITOML, `body = "Body"`, `body = "Body"`+"\nredirect_error = \"/err\"", 1)
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "redirect_error: not valid on auth=\"api-key\"") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+// TestValidate_FormMode_RejectsAPIKeys catches the operator-misconfiguration
+// where api_keys are present but auth was forgotten — without this check
+// the config would silently fall back to form mode with the keys dead-code.
+func TestValidate_FormMode_RejectsAPIKeys(t *testing.T) {
+	bad := strings.Replace(minimalTOML, `body = "Body"`, `body = "Body"`+"\napi_keys = [\"x\"]", 1)
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "api_keys: must be unset unless auth = \"api-key\"") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+// --- v1.0 block C: CSRF (Story 10.3) ---
+
+func TestValidate_APIKeyMode_RejectsCSRFSecret(t *testing.T) {
+	bad := strings.Replace(minimalAPITOML, `body = "Body"`, `body = "Body"`+"\ncsrf_secret = \"0123456789abcdef0123456789abcdef\"", 1)
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "csrf_secret: not valid on auth=\"api-key\"") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_FormMode_CSRFShortSecret(t *testing.T) {
+	bad := strings.Replace(minimalTOML, `body = "Body"`, `body = "Body"`+"\ncsrf_secret = \"too-short\"", 1)
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "csrf_secret must be at least") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestValidate_FormMode_CSRFSecretValid(t *testing.T) {
+	c := strings.Replace(minimalTOML, `body = "Body"`,
+		`body = "Body"`+"\ncsrf_secret = \"0123456789abcdef0123456789abcdef\"\ncsrf_token_ttl = \"30m\"", 1)
+	cfg, err := loadString(t, c)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	ep := cfg.Endpoints[0]
+	if len(ep.CSRFSecret) != 32 {
+		t.Errorf("CSRFSecret length = %d, want 32", len(ep.CSRFSecret))
+	}
+	if ep.CSRFTokenTTL.Std() != 30*time.Minute {
+		t.Errorf("CSRFTokenTTL = %v, want 30m", ep.CSRFTokenTTL.Std())
+	}
+}
+
+func TestValidate_FormMode_CSRFNegativeTTL(t *testing.T) {
+	bad := strings.Replace(minimalTOML, `body = "Body"`,
+		`body = "Body"`+"\ncsrf_secret = \"0123456789abcdef0123456789abcdef\"\ncsrf_token_ttl = \"-1m\"", 1)
+	_, err := loadString(t, bad)
+	if err == nil || !strings.Contains(err.Error(), "csrf_token_ttl") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestLoad_APIKeyMode_EnvVarSubstitution(t *testing.T) {
+	t.Setenv("WORKER_KEY", "resolved-key-abc")
+	c := strings.Replace(minimalAPITOML, `api_keys = ["worker-key-1"]`, `api_keys = ["${env.WORKER_KEY}"]`, 1)
+	cfg, err := loadString(t, c)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Endpoints[0].APIKeys[0]; got != "resolved-key-abc" {
+		t.Errorf("APIKeys[0] = %q, want resolved env var value", got)
+	}
+}
+
+// TestLoad_EnvVar_BodyTemplateNotInterpolated guards against the env-var
+// resolver accidentally substituting Go template syntax that happens to
+// include a dollar-brace pattern. Body templates use {{.Name}} (Go's
+// standard syntax), which doesn't match our envVarPattern, but this
+// test pins the contract.
+func TestLoad_EnvVar_BodyTemplateNotInterpolated(t *testing.T) {
+	c := strings.Replace(
+		minimalTOML,
+		`body = "Body"`,
+		`body = "Hello {{.name}}, your message was: {{.message}}"`,
+		1,
+	)
+	cfg, err := loadString(t, c)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := "Hello {{.name}}, your message was: {{.message}}"
+	if got := cfg.Endpoints[0].Body; got != want {
+		t.Errorf("Body = %q, want %q (template syntax must pass through unchanged)", got, want)
+	}
+}
+
+// TestSMTPListenerConfig_EffectiveRequireTLS pins the security-by-default
+// posture: when the operator omits `require_tls`, the listener requires
+// STARTTLS. Operators explicitly set `require_tls = false` to opt into
+// plaintext (local dev only). Marketing copy and docs depend on this
+// default — a regression here would silently re-open a CVE-shaped hole.
+func TestSMTPListenerConfig_EffectiveRequireTLS(t *testing.T) {
+	t.Run("unset defaults to true", func(t *testing.T) {
+		s := &config.SMTPListenerConfig{}
+		if !s.EffectiveRequireTLS() {
+			t.Error("RequireTLS unset must resolve to true (security-by-default)")
+		}
+	})
+	t.Run("explicit true", func(t *testing.T) {
+		v := true
+		s := &config.SMTPListenerConfig{RequireTLS: &v}
+		if !s.EffectiveRequireTLS() {
+			t.Error("explicit true must resolve to true")
+		}
+	})
+	t.Run("explicit false", func(t *testing.T) {
+		v := false
+		s := &config.SMTPListenerConfig{RequireTLS: &v}
+		if s.EffectiveRequireTLS() {
+			t.Error("explicit false must resolve to false (operator opted into plaintext)")
+		}
+	})
+}
+
+// TestLoad_UnknownField_Rejects pins the strict-field behavior: a typo
+// or stale config key (the canonical case being someone writing
+// `starttls = true` when the real field is `require_tls`) must fail
+// parsing rather than silently render the runtime behavior wrong.
+//
+// Spec: a real user hit this exact case wiring Remark42; the TOML parser
+// silently accepted `starttls` and STARTTLS wasn't actually advertised,
+// leaving the operator to debug runtime behavior with no surfaceable
+// signal. This test prevents the regression class.
+func TestLoad_UnknownField_Rejects(t *testing.T) {
+	t.Run("top-level typo", func(t *testing.T) {
+		// Prefix a stray top-level key. (Must be before any [table]
+		// header — bare keys appended after a table header attach to
+		// that table, and transport.settings is map[string]any which
+		// legitimately catches arbitrary provider-specific keys.)
+		c := "mysterious_setting = true\n" + minimalTOML
+		_, err := loadString(t, c)
+		if err == nil {
+			t.Fatal("expected unknown-field error for stray top-level key")
+		}
+		if !strings.Contains(err.Error(), "unknown field") {
+			t.Errorf("error should mention 'unknown field': %v", err)
+		}
+		if !strings.Contains(err.Error(), "mysterious_setting") {
+			t.Errorf("error should name the offending key: %v", err)
+		}
+	})
+	t.Run("nested typo in smtp_listener", func(t *testing.T) {
+		// `starttls` doesn't exist; the real key is `require_tls`.
+		c := minimalTOML + `
+[smtp_listener]
+listen = ":2525"
+starttls = true
+allowed_senders = ["*@example.com"]
+
+[[smtp_listener.smtp_users]]
+username = "u"
+password = "p"
+
+[smtp_listener.transport]
+type = "postmark"
+
+[smtp_listener.transport.settings]
+api_key = "k"
+`
+		_, err := loadString(t, c)
+		if err == nil {
+			t.Fatal("expected unknown-field error for `starttls`")
+		}
+		if !strings.Contains(err.Error(), "starttls") {
+			t.Errorf("error should name `starttls` as the offending key: %v", err)
+		}
+	})
+	t.Run("typo in endpoint", func(t *testing.T) {
+		// `csrf_secrets` (plural) doesn't exist; the real key is `csrf_secret`.
+		c := strings.Replace(minimalTOML,
+			`body = "Body"`,
+			`body = "Body"`+"\n"+`csrf_secrets = "0123456789abcdef0123456789abcdef"`,
+			1)
+		_, err := loadString(t, c)
+		if err == nil {
+			t.Fatal("expected unknown-field error for `csrf_secrets` (plural typo)")
+		}
+		if !strings.Contains(err.Error(), "csrf_secrets") {
+			t.Errorf("error should name the offending key: %v", err)
+		}
+	})
+}
+
+// --- v1.2 spam checks: mode-mutex + block validation ---
+
+func TestValidate_APIKeyMode_RejectsSpamChecks(t *testing.T) {
+	for _, tc := range []struct{ name, block, want string }{
+		{"reputation", "\n[endpoints.reputation]\nprovider = \"stopforumspam\"\ncheck = [\"email\"]\n", "reputation: not valid on auth=\"api-key\""},
+		{"proof_of_browser", "\n[endpoints.proof_of_browser]\nttl = \"30m\"\n", "proof_of_browser: not valid on auth=\"api-key\""},
+		{"captcha", "\n[endpoints.captcha]\nprovider = \"turnstile\"\nsecret_key = \"k\"\n", "captcha: not valid on auth=\"api-key\""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadString(t, minimalAPITOML+tc.block)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("want %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestValidate_Reputation_Block(t *testing.T) {
+	for _, tc := range []struct{ name, block, want string }{
+		{"bad provider", "\n[endpoints.reputation]\nprovider = \"akismet\"\ncheck = [\"email\"]\n", "only \"stopforumspam\""},
+		{"empty check", "\n[endpoints.reputation]\nprovider = \"stopforumspam\"\ncheck = []\n", "at least one of"},
+		{"unknown check", "\n[endpoints.reputation]\nprovider = \"stopforumspam\"\ncheck = [\"phone\"]\n", "unknown value"},
+		{"confidence range", "\n[endpoints.reputation]\nprovider = \"stopforumspam\"\ncheck = [\"ip\"]\nconfidence = 150\n", "0"},
+		{"ok", "\n[endpoints.reputation]\nprovider = \"stopforumspam\"\ncheck = [\"email\", \"ip\"]\nconfidence = 90\n", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadString(t, minimalTOML+tc.block)
+			if tc.want == "" {
+				if err != nil {
+					t.Errorf("want ok, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("want %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestValidate_ProofOfBrowser_Block(t *testing.T) {
+	// min_age must be less than ttl.
+	bad := minimalTOML + "\n[endpoints.proof_of_browser]\nttl = \"10s\"\nmin_age = \"20s\"\n"
+	if _, err := loadString(t, bad); err == nil || !strings.Contains(err.Error(), "min_age") {
+		t.Errorf("want min_age<ttl error, got %v", err)
+	}
+	ok := minimalTOML + "\n[endpoints.proof_of_browser]\nttl = \"30m\"\nmin_age = \"3s\"\n"
+	if _, err := loadString(t, ok); err != nil {
+		t.Errorf("valid proof_of_browser should load, got %v", err)
+	}
+}
+
+func TestValidate_Captcha_Block(t *testing.T) {
+	for _, tc := range []struct{ name, block, want string }{
+		{"bad provider", "\n[endpoints.captcha]\nprovider = \"recaptcha\"\nsecret_key = \"k\"\n", "only \"turnstile\""},
+		{"missing secret", "\n[endpoints.captcha]\nprovider = \"turnstile\"\n", "secret_key"},
+		{"bad on_provider_error", "\n[endpoints.captcha]\nprovider = \"turnstile\"\nsecret_key = \"k\"\non_provider_error = \"maybe\"\n", "on_provider_error"},
+		{"ok", "\n[endpoints.captcha]\nprovider = \"turnstile\"\nsecret_key = \"k\"\non_provider_error = \"open\"\n", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadString(t, minimalTOML+tc.block)
+			if tc.want == "" {
+				if err != nil {
+					t.Errorf("want ok, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("want %q, got %v", tc.want, err)
+			}
+		})
+	}
+}

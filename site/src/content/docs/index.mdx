@@ -1,0 +1,235 @@
+---
+title: Posthorn
+description: The unified outbound mail layer for self-hosted projects. One gateway between your apps and your transactional mail provider — Postmark, Resend, Mailgun, AWS SES, outbound-SMTP. Self-hosted, no mail server required.
+template: splash
+hero:
+  tagline: Self-hosted mail without the mail server. One outbound layer between every app you run and your transactional provider — Postmark, Resend, Mailgun, AWS SES, or outbound-SMTP. Three ingress shapes (HTTP form, HTTP API, SMTP).
+  image:
+    file: ../../assets/logo.svg
+  actions:
+    - text: Get started
+      link: /getting-started/installation/
+      icon: right-arrow
+      variant: primary
+    - text: View the roadmap
+      link: /roadmap/
+      icon: right-arrow
+      variant: secondary
+    - text: GitHub
+      link: https://github.com/craigmccaskill/posthorn
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, Code, LinkCard, Aside } from '@astrojs/starlight/components';
+
+## Why Posthorn?
+
+**Nobody wants to run a mail server in 2026.** Self-hosted operators use Postmark, Resend, Mailgun, or AWS SES because they're cheap, they handle deliverability properly, and somebody else can worry about sender authentication, bounce processing, and reputation management.
+
+But every app you self-host has to integrate with that service **independently.** Your contact form. Your Ghost blog's admin emails. Your Gitea magic links. Your Mastodon notifications. Your worker that fires a license-delivery email when someone pays. Each one needs its own copy of the API key, its own integration code, its own quirks around retry and bounce handling. **The same outbound concern duplicated five times across your stack.**
+
+And on cloud hosts that block outbound SMTP — DigitalOcean, AWS Lightsail, Linode, Vultr — the SMTP-only apps don't work at all without a workaround.
+
+**Posthorn is the bridge.** One container, one config, one set of credentials. Your apps point at Posthorn. Posthorn talks to your transactional mail provider.
+
+```d2
+direction: right
+
+apps: Your apps {
+  hugo: "Hugo contact form"
+  ghost: Ghost
+  gitea: Gitea
+  mastodon: Mastodon
+  worker: "Payment worker"
+  cron: "Cron script"
+}
+
+posthorn: Posthorn
+
+provider: "Postmark · Resend\nMailgun · AWS SES\nOutbound SMTP"
+
+apps -> posthorn: "HTTP / SMTP"
+posthorn -> provider: "HTTPS\n(one credential)"
+```
+
+## What you connect → what you route to
+
+**Three ingress shapes.** Pick the one that fits each of your apps; one Posthorn instance handles all of them.
+
+<CardGrid>
+  <Card title="HTTP form ingress" icon="rocket">
+    Contact forms, signup forms, alert webhooks.
+    `application/x-www-form-urlencoded` and `multipart/form-data` POSTs on
+    configured paths. Drop the form on your static site or behind your
+    reverse proxy, point its `action` at Posthorn.
+  </Card>
+  <Card title="JSON API ingress" icon="seti:json">
+    Server-to-server callers: workers, cron jobs, payment handlers,
+    internal services. Standard `Authorization: Bearer` auth.
+    Idempotency keys for safe retries. Per-request `to_override` for
+    transactional sends.
+  </Card>
+  <Card title="SMTP ingress" icon="email">
+    For apps that only speak SMTP: Ghost, Gitea, Mastodon, Matrix,
+    NextCloud, Authentik. Posthorn accepts SMTP on your local network
+    (AUTH PLAIN or client-cert, STARTTLS-required) and forwards via your
+    configured HTTP API transport.
+  </Card>
+</CardGrid>
+
+**Five transports,** all shipping today. Swap providers without rewriting your apps' integrations — they all talk to Posthorn the same way.
+
+<CardGrid>
+  <Card title="Postmark, Resend, Mailgun" icon="email">
+    Bespoke HTTP clients, ~200-250 lines each. No third-party SDK
+    overhead. Headers pass through each upstream's structured API — no
+    string concatenation, no injection vector. API keys never appear
+    in logs. Mailgun supports US + EU regions.
+  </Card>
+  <Card title="AWS SES, outbound SMTP" icon="puzzle">
+    SES uses a bespoke Signature Version 4 (SigV4) implementation
+    (no AWS SDK, no transitive dep tree). Outbound SMTP relays through
+    any STARTTLS-capable
+    upstream — your Postfix smarthost, Mailtrap, Mailgun SMTP. Swap
+    transports without changing app code or operator runbooks; every
+    endpoint config has the same shape.
+  </Card>
+  <Card title="Webhook delivery" icon="random">
+    **v2 — later.** Point Posthorn at any URL for non-email delivery
+    (Slack, internal HTTP processors, analytics pipelines). Fan out one
+    submission across email + webhook + log archive.
+  </Card>
+</CardGrid>
+
+## Built for self-hosted, built for production
+
+<CardGrid>
+  <Card title="Defense in depth" icon="shield">
+    Honeypot, Origin/Referer fail-closed, token-bucket rate limit with
+    LRU eviction, max body size, required-field validation, email
+    syntax check, signed CSRF tokens. API-key auth for server-to-server
+    callers. SMTP listener gates open-relay abuse via sender allowlist,
+    recipient cap, AUTH PLAIN, and required STARTTLS.
+  </Card>
+  <Card title="One deployment shape, every front door" icon="puzzle">
+    Standalone Docker container (or Go binary) that runs as a sidecar
+    to your apps. Reverse-proxy your form endpoints from whatever
+    front door you already use — Caddy, nginx, Traefik, Cloudflare.
+  </Card>
+  <Card title="Structured for ops" icon="document">
+    JSON logs with UUIDv4 submission IDs. Hard 10-second request timeout.
+    `/healthz` liveness probe and Prometheus `/metrics` exposition on the
+    same listener. SQLite-backed retry queue across restarts in v2.
+    Designed to drop into your existing logging pipeline, not replace it.
+  </Card>
+  <Card title="No mail-server skills required" icon="approve-check">
+    You don't run Postfix. You don't manage DKIM rotation. You bring an
+    API key from your transactional provider and a TOML config. Posthorn
+    handles the gateway logic.
+  </Card>
+  <Card title="Retry that respects deadlines" icon="random">
+    One retry on transient/5xx (1s backoff), one retry on 429 (5s backoff),
+    no retry on 4xx config errors, hard 10-second timeout including
+    retries. Failed submissions log the full payload so you can recover.
+  </Card>
+  <Card title="Public roadmap, locked spec" icon="open-book">
+    [Roadmap](/roadmap/) is public, milestones track in GitHub, every
+    feature traces back to a versioned spec. v1.0 is the full surface;
+    v2 (durable storage, suppression, lifecycle webhooks, attachments)
+    is the next milestone.
+  </Card>
+</CardGrid>
+
+## Five-minute setup
+
+The simplest path: a contact form on a static site, behind a reverse proxy.
+
+```yaml
+# docker-compose.yml
+services:
+  posthorn:
+    image: ghcr.io/craigmccaskill/posthorn:latest
+    volumes:
+      - ./posthorn.toml:/etc/posthorn/config.toml:ro
+    environment:
+      POSTMARK_API_KEY: ${POSTMARK_API_KEY}
+    ports:
+      - "127.0.0.1:8080:8080"
+```
+
+```toml
+# posthorn.toml
+[[endpoints]]
+path = "/api/contact"
+to = ["you@example.com"]
+from = "Contact Form <noreply@example.com>"
+honeypot = "_gotcha"
+allowed_origins = ["https://example.com"]
+required = ["name", "email", "message"]
+subject = "Contact from {{.name}}"
+body = """
+From: {{.name}} <{{.email}}>
+
+{{.message}}
+"""
+
+[endpoints.transport]
+type = "postmark"
+
+[endpoints.transport.settings]
+api_key = "${env.POSTMARK_API_KEY}"
+
+[endpoints.rate_limit]
+count = 5
+interval = "1m"
+```
+
+Reverse-proxy `/api/contact` from your front door (Caddy, nginx, Traefik) to `http://posthorn:8080`. Point your form's `action` at `/api/contact`. Done.
+
+Full walkthrough: [posthorn.dev/getting-started/quick-start](/getting-started/quick-start/).
+
+<LinkCard
+  title="Installation guide"
+  description="Docker Compose or a standalone Go binary — pick a path."
+  href="/getting-started/installation/"
+/>
+
+<LinkCard
+  title="Quick start"
+  description="A working contact form in five minutes against a real Postmark account."
+  href="/getting-started/quick-start/"
+/>
+
+<LinkCard
+  title="Roadmap"
+  description="What's in v1.0 and the v2 trajectory (durable storage, suppression, lifecycle webhooks, attachments). Linked to open GitHub milestones."
+  href="/roadmap/"
+/>
+
+## What Posthorn is not
+
+To save you a wrong turn. Three categories of self-hosted email infrastructure exist; Posthorn occupies exactly one.
+
+| | What Posthorn doesn't do | Look at instead |
+|---|---|---|
+| **Not a mail server** | No mailbox storage, no IMAP / JMAP, no DKIM key management. | [Stalwart](https://stalw.art), [Mailcow](https://mailcow.email), [iRedMail](https://www.iredmail.org) |
+| **Not its own outbound infrastructure** | Posthorn relays through a provider you chose; it doesn't run its own SMTP fleet, doesn't manage IP reputation, doesn't compete on feature count with Mailgun-class platforms. | [Postal](https://postalserver.io), [Hyvor Relay](https://hyvor.com/relay) |
+| **Not a marketing email platform** | No list management, no segmentation, no campaign dashboard. | [Listmonk](https://listmonk.app) |
+| **Not webmail / a mailbox UI** | No interface for reading mail. | Roundcube, Snappymail (paired with a real mail server) |
+
+The wedge is **the integration layer** between your self-hosted apps and the transactional provider you've already picked. If you need a different tool above, those projects are better at their thing than Posthorn would ever be — and Posthorn is intentionally a different shape.
+
+## How Posthorn is built
+
+A few principles that shape every decision. See [Design principles](/design-principles/) for the full set with reasoning.
+
+- **Gateway, not infrastructure.** Posthorn sits *between* your apps and a provider you already chose. It doesn't run its own outbound mail server, doesn't manage IP reputation, doesn't host mailboxes.
+- **Integration layer, not mail-receiving layer.** Many ingress shapes converge on one transport surface — many inputs, one output. Receiving mail is somebody else's job.
+- **Config over admin UI.** A single TOML file is the source of truth. Reviewing a config diff is reviewing the system's behavior. No runtime mutation surface.
+- **Bespoke transports, no SDKs.** Three external Go dependencies in the whole module — a TOML parser, a UUID library, an LRU cache. Every transport is ~200-400 lines of focused Go, auditable in an afternoon.
+- **Locked spec, public roadmap.** Every feature traces back to a numbered requirement. No quiet drift between docs and behavior.
+
+## License & status
+
+Apache-2.0. See the [GitHub releases page](https://github.com/craigmccaskill/posthorn/releases) for the current tag and [open milestones](https://github.com/craigmccaskill/posthorn/milestones) for what's queued next. The full v1.0 specification is [in `spec/`](https://github.com/craigmccaskill/posthorn/tree/main/spec); the v2 trajectory lives on the [roadmap page](/roadmap/).

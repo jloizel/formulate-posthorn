@@ -1,0 +1,158 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+The v2.0 work — the stateful shift, recut 2026-08-02 against the integration-seam USP (unsubscribe injection and fan-out moved out behind demand gates; see the roadmap). Everything below is opt-in: a config without the new blocks behaves identically to v1.2.
+
+### Added
+
+- **HTML email bodies ([#5](https://github.com/craigmccaskill/posthorn/issues/5), ADR-19).** Per-endpoint `body_format = "html"`: the body template renders through `html/template` with contextual auto-escaping, so submitter input is inert markup by construction. Plain-text part auto-derived from the rendered HTML (or supply `text_body`); multipart delivery on all five transports; existing file-based HTML templates work directly via `body = "templates/x.html"`. The SMTP listener now accepts HTML mail — `text/html` maps through, and HTML-only messages (previously rejected `554`) are accepted with a derived text part.
+- **Storage spine ([#21](https://github.com/craigmccaskill/posthorn/issues/21), [#22](https://github.com/craigmccaskill/posthorn/issues/22), ADR-20/21).** Optional `[storage]` block: SQLite (pure-Go driver; static builds unchanged) submission log, sync-first retry queue — 200 still means sent; api-mode callers get `202 {"status":"queued"}` where v1.x dropped mail after inline retries, and queued sends survive restarts with exponential backoff. Durable idempotency (byte-identical replays across restarts). Retention pruning, a hard `max_size` cap so Posthorn can never fill its own disk, and a storage canary in `/healthz` + `posthorn_storage_healthy`; storage failure degrades to v1.x behavior — mail never blocks on the disk.
+- **Lifecycle events + suppression ([#8](https://github.com/craigmccaskill/posthorn/issues/8), [#4](https://github.com/craigmccaskill/posthorn/issues/4), ADR-22/23).** `[lifecycle]` enables a basic-auth-protected Postmark event sink; events normalize to a provider-agnostic shape and forward, HMAC-signed, to per-endpoint `webhook_url`s with retry. Hard bounces and spam complaints auto-suppress globally; suppressed sends answer `200 {"status":"suppressed"}` / SMTP `250` (terminally handled — never retried). Managed via the new `posthorn suppressions list|add|remove` CLI; no HTTP admin API.
+- **Webhook transport ([#23](https://github.com/craigmccaskill/posthorn/issues/23), ADR-24).** `type = "webhook"` delivers the structured submission (id, envelope, bodies, raw fields) as a signed JSON POST — same retry classification and queueing as mail.
+- **File attachments ([#24](https://github.com/craigmccaskill/posthorn/issues/24), ADR-25).** Opt-in `[endpoints.attachments]` with a required `allowed_types` allowlist enforced on the sniffed bytes, never the declared type. Form-mode multipart files and api-mode base64 `attachments`; carried by all five mail transports.
+- New metrics: queue counters/gauges, lifecycle event/forward counters, `posthorn_suppressed_recipients_total`.
+
+### Fixed
+
+- Multipart form **fields** were silently dropped in v1.x — `multipart/form-data` submissions never delivered their values to validation, spam checks, or templates. Form parsing is now content-type-aware.
+
+### Security
+
+- Doctrine, spec-level (NFR25): security-relevant features are opt-in, never default-on. The lifecycle event endpoint cannot run unauthenticated; attachments require an explicit type allowlist; storage requires an explicit block.
+
+## [1.2.0] — 2026-07-04
+
+Spam-protection minor. Adds three content-agnostic checks that target automated contact-form spam — the kind that fills valid-looking fields, varies its wording and language, and reuses throwaway sender addresses, so there's no content signature to match. All are opt-in, form-mode only, and backwards-compatible; existing configs are unaffected.
+
+### Added
+
+- **Reputation check ([#44](https://github.com/craigmccaskill/posthorn/issues/44)).** Optional `[endpoints.reputation]` — a StopForumSpam lookup on the submitter email and/or IP before send, blocking known form-spam identities regardless of message content or language. Bounded LRU result cache; fails open by default so a provider outage never blocks real mail (fail-open events increment `posthorn_check_failed_open_total{check="reputation"}`). Sends email+IP to a third party — opt-in.
+- **Proof-of-browser check ([#45](https://github.com/craigmccaskill/posthorn/issues/45), ADR-18).** Optional `[endpoints.proof_of_browser]` — Posthorn serves a challenge token from a `GET` on the endpoint that only page JavaScript can fetch and inject as `_pob_token`, blocking bots that POST the form directly. An optional `min_age` time-trap rejects impossibly-fast submissions. No third party; works on static sites.
+- **Captcha check ([#33](https://github.com/craigmccaskill/posthorn/issues/33)).** Optional `[endpoints.captcha]` — Cloudflare Turnstile verification, the escalation tier for bots that render a real browser. Byte-identical silent 200 on a rejected token; fails closed by default on a provider outage.
+- New `posthorn_check_failed_open_total{endpoint,check}` metric and `spam_blocked` kinds `reputation` / `proof_of_browser` / `captcha`.
+
+### Changed
+
+- The three spam checks (origin, honeypot, CSRF) were refactored into a two-phase pipeline ([#60](https://github.com/craigmccaskill/posthorn/issues/60)): header checks pre-parse, form checks post-parse, each producing a `spam.Verdict` the handler renders through one mapping. No behavior change — the extraction is what let the three new checks land as small additions rather than more inline blocks.
+
+### Fixed
+
+- The SMTP ingress was constructed with a nil metrics recorder, so `posthorn_submissions_sent_total{endpoint="smtp_listener"}` and its failure counter never emitted. The registry and recorder are now shared with the HTTP mux, and the real send latency is recorded (was hardcoded 0). ([#57](https://github.com/craigmccaskill/posthorn/issues/57))
+- `posthorn validate` now builds the SMTP ingress, so a listener config with a semantic error (e.g. `require_tls` with no `tls_cert`) is caught at validate time instead of failing at boot. ([#58](https://github.com/craigmccaskill/posthorn/issues/58))
+
+### Recipes
+
+- Added Authentik and Mastodon SMTP-listener recipes to the docs site.
+
+## [1.1.0] — 2026-07-04
+
+A security-hardening and operational-maturity release, from a full audit of the shipped v1.0. One breaking change (below) that closes an open-relay footgun; everything else is additive or a fix.
+
+### Breaking
+
+- **`auth_required = "none"` on a public bind is now refused at config-parse time ([#41](https://github.com/craigmccaskill/posthorn/issues/41)).** An SMTP listener with `auth_required = "none"` whose `listen` address is not verifiably loopback/private (e.g. `:2525`, `0.0.0.0:2525`, a public IP, or an unresolvable hostname) is a startup error. Set `trusted_network = true` to assert the listener is reachable only from a trusted network — a Docker bridge with no `ports:` exposure, a VPN, or a firewall. **Migration:** deployments built from the pre-existing Ghost / Gitea / internal-relay recipes used `auth_required = "none"` with `listen = ":2525"` and must add `trusted_network = true` (the updated recipes include it). This closes the open-relay footgun where the sender allowlist was the only gate on an unauthenticated public listener.
+
+### Added
+
+- **SMTP listener brute-force and resource hardening ([#50](https://github.com/craigmccaskill/posthorn/issues/50)).** Per-remote-IP AUTH-failure budget (10 failures/minute; further attempts get `421` and the connection closes; successful auths never consume budget). Global (`max_connections`, default 100) and per-IP (`max_connections_per_ip`, default 16) concurrent-connection caps; over-cap connections get a `421` before any protocol work.
+- CSRF rejections now increment `posthorn_spam_blocked_total{kind="csrf"}` — previously they were log-only and invisible on `/metrics`.
+- `spam_blocked` (honeypot and origin) and `csrf_rejected` log lines now carry `client_ip` for operator forensics, matching `rate_limited`; omitted when `strip_client_ip = true` (FR59).
+
+### Fixed
+
+- An `[smtp_listener]`-only config (no `[[endpoints]]`) is now accepted — the config validator required at least one HTTP endpoint, breaking the documented Ghost and Gitea recipes and every SMTP-listener-only deployment. `posthorn validate` output now names the listener so a listener-only config doesn't report a bare "0 endpoint(s)". ([#37](https://github.com/craigmccaskill/posthorn/issues/37))
+- SMTP-listener sends now honor the FR19-22 retry policy — a transient provider error is retried once (as the HTTP ingress already did) instead of returning an immediate `451`. Previously a provider blip could drop a transactional email on the SMTP path that the HTTP path would have retried. The retry policy is now shared between both ingresses. ([#59](https://github.com/craigmccaskill/posthorn/issues/59))
+- The HTTP server now sets `ReadTimeout` (15s) and `WriteTimeout` (30s, chosen to exceed `ReadTimeout` + the handler's 10s request bound so a legitimate slow upload followed by a provider retry isn't truncated after the mail was sent) plus an explicit 64 KB `MaxHeaderBytes`, so slow-body senders and slow-reading clients can't hold connections indefinitely. ([#42](https://github.com/craigmccaskill/posthorn/issues/42))
+- Raw stdlib parse errors are no longer echoed to clients on malformed bodies; both parse paths return a generic 400 and log the detail server-side as `body_parse_failed`. Deliberate API-shape messages (e.g. "nested objects are not supported") remain client-visible. ([#42](https://github.com/craigmccaskill/posthorn/issues/42))
+
+### Security & supply chain
+
+- CI now runs a `gofmt` gate, `govulncheck`, and `golangci-lint` on every push and pull request. ([#38](https://github.com/craigmccaskill/posthorn/issues/38))
+- Docker base images are pinned by digest, and Dependabot keeps the base images, Go modules, and GitHub Actions current. ([#39](https://github.com/craigmccaskill/posthorn/issues/39))
+- Release images now ship SLSA provenance and SBOM attestations, are signed with cosign (keyless via GitHub OIDC), and are gated on a Trivy vulnerability scan. ([#56](https://github.com/craigmccaskill/posthorn/issues/56))
+
+### Development
+
+- New hermetic provider-testing harness (`core/providertest`): ingress→egress end-to-end tests for all five transports and the SMTP listener, run on every PR with no credentials. A `make test-live` runner and a scheduled, protected workflow validate against real provider APIs (against non-delivering targets; SES via OIDC, no stored key). See [#76](https://github.com/craigmccaskill/posthorn/issues/76). Posthorn deliberately does not test deliverability/DKIM — the provider owns signing and reputation.
+
+## [1.0.0] — 2026-05-26
+
+Initial public release. The v1.0 spec is in [`spec/`](./spec/). Four feature blocks ship in a single release: form-mode HTTP ingress, API-mode HTTP ingress, multi-transport + operational maturity, and an SMTP listener. Originally sequenced as v1.0 → v1.1 → v1.2 → v1.3 themed releases; consolidated into v1.0 before tag.
+
+### Block A — HTTP form ingress
+
+- HTTP form ingress with multiple independent endpoints per config (FR1, FR2)
+- Postmark HTTP API transport with bespoke ~80-line client (FR3, FR4, ADR-1)
+- Honeypot field, Origin/Referer fail-closed check, max body size (1 MB safe default; configurable), token-bucket rate limit with LRU eviction at 10K IPs (FR5–FR9, NFR4, NFR6)
+- Required-field and email-format validation returning structured 422 (FR10, FR11)
+- Go `text/template` rendering for subject and body with custom-fields passthrough block (FR12, FR13)
+- JSON responses, content negotiation, `redirect_success` / `redirect_error` (FR14–FR16)
+- Per-request UUIDv4 `submission_id` in the 200 JSON body on both real-success and silent-honeypot paths — byte-identical body shape so a bot inspecting the response cannot distinguish honeypot rejection from success (FR5, NFR5)
+- Retry policy: one retry on transient/5xx (1s), one retry on 429 (5s), no retry on 4xx config errors, 10s hard request timeout (FR19–FR22)
+- Structured JSON logging with UUIDv4 submission IDs propagated through every log line; `submission_sent` carries `transport_message_id` so operators jump straight from Posthorn logs to the provider's UI (FR17, FR18, NFR7, NFR8)
+- Standalone binary `cmd/posthorn` with `serve` and `validate` subcommands, SIGTERM/SIGINT graceful shutdown (FR24–FR26)
+- Multi-stage Dockerfile producing a distroless static image for `linux/amd64` and `linux/arm64`, published to `ghcr.io/craigmccaskill/posthorn` on tag push (NFR12, NFR13)
+- GitHub Actions CI: `go vet` and `go test -race -count=1`
+- Public documentation site at [posthorn.dev](https://posthorn.dev) (Astro + Starlight)
+- Strict TOML field validation — unknown / misspelled config keys (e.g., `starttls` when the real field is `require_tls`) fail at parse time with a clear error naming the offending key, rather than being silently ignored and producing wrong runtime behavior.
+
+### Block B — API mode
+
+- API-mode endpoints via per-endpoint `auth = "api-key"` config; default `auth = "form"` preserves form-mode behavior (FR31, FR45)
+- API-key authentication via `Authorization: Bearer <key>` with constant-time comparison (`crypto/subtle.ConstantTimeCompare`); multiple keys per endpoint for rotation (FR33, FR34, NFR19)
+- Per-API-key rate limiting on API-mode endpoints — workers sharing egress IPs (Cloudflare Workers, etc.) get independent buckets (FR35)
+- JSON content type on API-mode endpoints (`application/json`); flat-object body shape with primitive type coercion to template variables; nested objects rejected with 400 (FR36, FR37, FR38, FR39)
+- Idempotency keys via standard `Idempotency-Key` header; in-memory per-endpoint LRU cache, 24-hour TTL, byte-identical response replay; HTTP 409 on concurrent in-flight collisions (FR40–FR44, NFR20)
+- New `core/idempotency/` package; new `idempotency_cache_size` endpoint config (default 10000)
+- Per-request `to_override` in api-mode JSON bodies — string or array of email addresses replaces the endpoint's `to` list for the request. Each address validated as syntactic email; empty array or any invalid address returns 422. `from` is intentionally not overridable to prevent spoofing via leaked keys (FR46, ADR-11)
+- API keys configured via `${env.VAR}` are subject to NFR3's "never appear in log output" invariant; tests verify with sentinel-key assertions (NFR21)
+- Per-IP brute-force defense for failed auth: 10 failed attempts from one IP within ~1 minute trip a bucket and subsequent failures return 429 (instead of 401) until the budget refills. Successful auths never consume the budget, so legitimate callers are unaffected. New `auth_rate_limited` log event records the lockout for forensic follow-up.
+
+### Block C — Multi-transport + operational maturity
+
+- **Resend** HTTP API transport — bespoke client (~150 LOC); Bearer auth; JSON body; ErrorClass mapping (FR47)
+- **Mailgun** HTTP API transport — bespoke client (~180 LOC); HTTP Basic auth; multipart/form-data body via `mime/multipart.Writer`; US + EU regions (FR48)
+- **AWS SES** transport — bespoke SigV4 implementation (~230 LOC) shared in `core/transport/awssigv4.go` for any future AWS-signed transport (S3, SNS) + SESv2 `SendEmail` request shape (~265 LOC) (FR49, ADR-14)
+- **Outbound SMTP** transport — stdlib `net/smtp.PlainAuth` + STARTTLS; per-Send connect/AUTH/MAIL/RCPT/DATA/QUIT cycle; 30s per-Send timeout (FR50, ADR-17)
+- Transport registry pattern — new file in `core/transport/` calls `Register()` in `init()`; config + cmd/posthorn dispatch through `Lookup()`. Adding a sixth transport requires zero edits to config or main (FR4, FR51, FR52, FR53)
+- `/healthz` endpoint returning `200 OK` with body `ok`; auth-free, fixed path (FR54)
+- `/metrics` endpoint with hand-rolled Prometheus text exposition (FR55, ADR-15) — counters for submissions received / sent / failed (with `error_class`), rate-limit hits, auth failures, spam blocks, idempotent replays, validation failures; latency histogram with operator-meaningful buckets. Submitter content never enters the label space (NFR24)
+- New `core/metrics/` package: `Registry`, `Counter`, `Histogram`, exposition writer; nil-safe `Recorder` for gateway integration
+- Dry-run mode via per-endpoint `dry_run = true` — runs full pipeline up to but not including `transport.Send`, returns 200 with `{"status":"dry_run","submission_id":"...","prepared_message":{...}}` (FR56)
+- CSRF tokens via HMAC-SHA256 over Unix timestamp — operator-issued at form-render time using `csrf_secret`; Posthorn verifies on submit; form-mode only (api-mode rejects `csrf_secret` at parse time) (FR57, ADR-16)
+- New `core/csrf/` package with `Issue` / `Verify` helpers; `csrf_secret` and `csrf_token_ttl` endpoint config; `_csrf_token` reserved form field name
+- Named `trusted_proxies` presets — `cloudflare` shipped in full; `aws-elb`, `gcp-lb`, `azure-front-door` reserved as empty slots awaiting maintained ranges. Mix presets and explicit CIDRs in one list (FR58)
+- `strip_client_ip` endpoint option — omits the resolved client IP from log lines (rate-limited, etc.) for GDPR-conscious deployments; rate-limit keying unaffected (FR59)
+
+### Block D — SMTP ingress
+
+- New `core/ingress/` package: minimal `Ingress` interface (Start/Stop/Name); `HTTPIngress` wraps `http.Server` for the v1.0 lifecycle (FR60, FR61, ADR-12)
+- New `core/smtp/` package: TCP listener accepting SMTP from internal clients; full state machine for EHLO/STARTTLS/AUTH/MAIL/RCPT/DATA/QUIT/RSET/NOOP (FR62)
+- SMTP AUTH PLAIN with constant-time password compare; client-cert auth as alternative (`auth_required = "either"`) (FR63)
+- `auth_required = "none"` mode for internal-network deployments where network access already implies trust (Docker bridge, loopback). Disables the AUTH state entirely; the sender allowlist (`allowed_senders`) and recipient cap remain in force as the only ingress gates. Pairs with `require_tls = false` to skip the TLS cert requirement.
+- STARTTLS required by default (`require_tls = true`); rejected before AUTH/MAIL when plaintext (FR67)
+- Sender allowlist (`allowed_senders`, exact-or-`*@domain` syntax) — required, non-empty (FR64)
+- Recipient cap OR allowlist (default cap 10 per session) preventing RCPT bombing (FR65)
+- Message size cap (`max_message_size`, default 1MB) — DATA exceeding returns `552 5.3.4` (FR66)
+- MIME → `transport.Message` conversion (FR68): recipients come from SMTP envelope (`RCPT TO`), never from MIME `To`/`Cc`/`Bcc` headers — a malicious DATA blob with smuggled `Bcc:` cannot add recipients (NFR22)
+- Per-session structured logging with `session_id` UUID; password never logged on auth failures (NFR23)
+- `cmd/posthorn` starts both HTTP and SMTP ingresses in their own goroutines when `[smtp_listener]` is configured; SIGTERM drains both with a 15s deadline
+
+### Removed (before tag)
+
+- The Caddy v2 adapter module (previously planned as a secondary deployment shape under FR27–FR30 / NFR10 / ADR-6 / ADR-7) was cut before tagging v1.0.0. The single-shape standalone-behind-any-reverse-proxy story keeps the product thesis cleaner and avoids ongoing per-feature carve-outs. Caddy users keep first-class support as a reverse proxy — see [posthorn.dev/deployment/reverse-proxy](https://posthorn.dev/deployment/reverse-proxy/).
+- Batch send API (originally listed as a v1.1 feature) was dropped 2026-05-16 — see [spec/01-project-brief.md](spec/01-project-brief.md) §"Deliberately not on the roadmap" for the reasoning. Reconsidered if a concrete operator workload surfaces with the need.
+
+### Documentation
+
+In addition to the per-feature pages, the site ships five recipes (contact form, newsletter signup, multi-form site, monitoring alerts, transactional email from a Cloudflare Worker, internal SMTP relay for Docker Compose), a [Design principles](https://posthorn.dev/design-principles/) page, a [Reading the logs](https://posthorn.dev/deployment/reading-logs/) ops guide, and a [Deploying API mode safely](https://posthorn.dev/deployment/api-mode-deployment/) guide covering loopback bind, Cloudflare Tunnel + Cloudflare Access service tokens, IP allowlist, and mTLS deployment shapes for API-mode endpoints.
+
+### Dependencies
+
+Three external Go dependencies in the entire module: `github.com/BurntSushi/toml`, `github.com/google/uuid`, `github.com/hashicorp/golang-lru/v2`. Every transport (Postmark, Resend, Mailgun, SES, outbound-SMTP) is bespoke — no vendor SDK in transport code per [ADR-1](spec/03-architecture.md).
